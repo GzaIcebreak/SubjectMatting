@@ -1,0 +1,65 @@
+name: Build macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest # Apple Silicon (arm64)
+    timeout-minutes: 60
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      GRADIO_ANALYTICS_ENABLED: "False"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          python -c "import platform, torch; print(platform.machine(), torch.__version__)"
+
+      - name: Unit tests
+        run: python -m pytest tests -q
+
+      - name: Build bundle
+        run: pyinstaller --noconfirm --clean packaging/SubjectMatting.spec
+
+      - name: Self-test the bundle (imports only, no model download)
+        run: SUBJECTMATTING_SELFTEST=1 dist/SubjectMatting.app/Contents/MacOS/SubjectMatting
+
+      - name: Ad-hoc sign
+        run: |
+          codesign --force --deep --sign - dist/SubjectMatting.app
+          codesign --verify --verbose=2 dist/SubjectMatting.app
+
+      - name: Zip
+        run: |
+          ditto -c -k --keepParent dist/SubjectMatting.app SubjectMatting-macos-arm64.zip
+          ls -lh SubjectMatting-macos-arm64.zip
+          du -sh dist/SubjectMatting.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SubjectMatting-macos-arm64
+          path: SubjectMatting-macos-arm64.zip
+          compression-level: 0 # already a zip
+          retention-days: 14
+
+      - name: GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" SubjectMatting-macos-arm64.zip \
+            --title "SubjectMatting $GITHUB_REF_NAME (macOS arm64)" \
+            --notes-file packaging/RELEASE_NOTES.md

@@ -1,0 +1,19 @@
+# Pinned to the versions the project was developed and benchmarked with (Python 3.12).
+# On Windows/Linux without a GPU, install torch from the CPU index first:
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+torchvision==0.29.1
+transformers==5.19.0
+huggingface_hub==2.2.0
+safetensors==0.8.0
+opencv-python-headless==5.0.0.93
+numpy==2.5.2
+pillow==12.3.0
+gradio==6.30.0
+gradio_client==2.7.2
+# Needed at runtime by BiRefNet's remote code (trust_remote_code), not imported by this project directly.
+timm==1.0.30
+kornia==0.8.3
+einops==0.8.2
+# Tests
+pytest==9.1.1
