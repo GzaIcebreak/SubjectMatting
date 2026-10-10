@@ -41,6 +41,59 @@ def output_names(files: list[Path]) -> list[str]:
     return [f"{f.stem}_{f.suffix[1:].lower()}.png" if stems[f.stem] > 1 else f"{f.stem}.png" for f in files]
 
 
+@dataclass
+class Job:
+    src: Path
+    dst: Path
+
+
+def plan_jobs(inputs: list[str | Path], out_dir: str | Path | None = None) -> tuple[list[Job], list[tuple[Path, str]]]:
+    """Dropped files/folders -> (jobs, skipped), with run_batch's naming rules.
+
+    A folder contributes its images (non-recursive); a loose image is grouped with its parent folder. Each group
+    goes to out_dir, or to default_output_dir(group folder) when out_dir is None. Duplicates are dropped, and
+    names that would still collide in a shared out_dir get _2, _3, ... appended.
+    """
+    out = Path(out_dir) if out_dir else None
+    groups: dict[Path, list[Path]] = {}
+    skipped: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for raw in inputs:
+        p = Path(raw)
+        if p.is_dir():
+            folder, files = p, list_images(p)
+            if not files:
+                skipped.append((p, "文件夹里没有图片"))
+        elif p.is_file():
+            if p.suffix.lower() not in IMAGE_EXTS:
+                skipped.append((p, "不支持的格式"))
+                continue
+            folder, files = p.parent, [p]
+        else:
+            skipped.append((p, "文件不存在"))
+            continue
+        for f in files:
+            if f.resolve() not in seen:
+                seen.add(f.resolve())
+                groups.setdefault(folder.resolve(), []).append(f)
+
+    jobs: list[Job] = []
+    used: set[Path] = set()
+    for folder, files in groups.items():
+        dst_dir = out or default_output_dir(folder)
+        if dst_dir.resolve() == folder:
+            skipped += [(f, "输出文件夹不能和输入文件夹相同") for f in files]
+            continue
+        for f, name in zip(files, output_names(files)):
+            dst, n = dst_dir / name, 1
+            while dst.resolve() in used:
+                n += 1
+                dst = dst_dir / f"{Path(name).stem}_{n}.png"
+            used.add(dst.resolve())
+            jobs.append(Job(f, dst))
+    return jobs, skipped
+
+
 def run_batch(pipe, folder: str | Path, out_dir: str | Path | None = None) -> Iterator[BatchEvent]:
     """Run pipe.run() on each image, save RGBA PNGs, yield one event per image. A failing image is reported
     via BatchEvent.error and does not stop the batch."""

@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 DEVICE = torch.device("cpu")
 WORK_LONG_SIDE = 1024
@@ -38,7 +38,8 @@ class Timer:
 
 
 def load_rgb(path: str | Path) -> Image.Image:
-    img = Image.open(path)
+    # Phone photos store their rotation in EXIF; apply it so the result is upright like in every viewer.
+    img = ImageOps.exif_transpose(Image.open(path))
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))

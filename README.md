@@ -7,12 +7,31 @@ BiRefNet_lite 显著性 → 点提示 → SAM2.1-hiera-tiny 物体补全 → tri
 CPU（Ultra 7 265K）上平均约 4.3s/张。设计见 [docs/2026-10-09-subject-matting-design.md](docs/2026-10-09-subject-matting-design.md)，
 测试结果见 [docs/2026-10-09-test-report.md](docs/2026-10-09-test-report.md)。
 
-## macOS 独立包（Apple Silicon）
+## macOS app（Apple Silicon）
 
-GitHub Actions 的 `macos-latest` runner 用 PyInstaller 打成 `SubjectMatting.app`（见 `.github/workflows/build-macos.yml`
-和 `packaging/SubjectMatting.spec`）。手动触发 workflow 可在 Actions 的 artifact 里拿到 `SubjectMatting-macos-arm64.zip`；
-推 `v*` 标签会自动创建 Release。安装与首次运行说明见 [packaging/RELEASE_NOTES.md](packaging/RELEASE_NOTES.md)
-（无开发者签名，首次需右键打开；模型首次运行时下载）。
+原生 SwiftUI 窗口 + 后台 Python 抠图进程（设计见 [docs/superpowers/specs/2026-10-10-native-macos-app-design.md](docs/superpowers/specs/2026-10-10-native-macos-app-design.md)）：
+
+- `macos/`：Swift Package。`MattingCore`（与 worker 的 JSON 协议、处理队列）+ `SubjectMatting`（界面）。
+- `worker.py`：抠图进程，stdin/stdout 每行一条 JSON，复用 `matting/`。用 `packaging/worker.spec` 打包。
+- `scripts/build_macos_app.sh`：组装 `dist/SubjectMatting.app` 并 ad-hoc 签名。
+
+本机构建：
+
+```bash
+.venv/bin/pyinstaller --noconfirm --clean packaging/worker.spec
+```
+```bash
+scripts/build_macos_app.sh
+```
+
+开发时不打包，直接用源码里的 worker 运行界面（在仓库根目录执行）：
+
+```bash
+SUBJECTMATTING_WORKER=".venv/bin/python worker.py" swift run --package-path macos SubjectMatting
+```
+
+测试：`swift test --package-path macos`。GitHub Actions（`.github/workflows/build-macos.yml`）跑完全部测试和一次真实模型的端到端抠图后打包；
+推 `v*` 标签会自动创建 Release。安装说明见 [packaging/RELEASE_NOTES.md](packaging/RELEASE_NOTES.md)（无开发者签名，首次打开需在「隐私与安全性」里点「仍要打开」）。
 
 ## 环境
 
@@ -30,6 +49,8 @@ python -m uv pip install --native-tls -p .venv transformers safetensors huggingf
 > 本机有 TLS 代理：pip 要加 `--use-feature=truststore`，uv 要加 `--native-tls`。
 
 ## 使用
+
+网页版（开发调试用，不在 Mac app 里）：
 
 ```bash
 .venv/Scripts/python app.py

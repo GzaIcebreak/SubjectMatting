@@ -31,29 +31,43 @@ jobs:
       - name: Unit tests
         run: python -m pytest tests -q
 
-      - name: Build bundle
-        run: pyinstaller --noconfirm --clean packaging/SubjectMatting.spec
+      - name: Swift tests
+        run: swift test --package-path macos
 
-      - name: Self-test the bundle (imports only, no model download)
-        run: SUBJECTMATTING_SELFTEST=1 dist/SubjectMatting.app/Contents/MacOS/SubjectMatting
+      - name: Build worker
+        run: pyinstaller --noconfirm --clean packaging/worker.spec
 
-      - name: Multiprocessing helper exits instead of relaunching the app
+      - name: Self-test the worker (imports only, no model download)
+        run: SUBJECTMATTING_SELFTEST=1 dist/matting-worker/matting-worker
+
+      - name: Multiprocessing helper exits instead of relaunching the worker
         # The bundle re-executes itself for multiprocessing's resource_tracker. Without freeze_support() that
-        # child runs the whole app (loads models, never exits) and the 60s alarm fails this step.
+        # child runs the whole worker (loads models, never exits) and the 60s alarm fails this step.
         run: |
-          perl -e 'alarm 60; exec @ARGV' dist/SubjectMatting.app/Contents/MacOS/SubjectMatting \
+          perl -e 'alarm 60; exec @ARGV' dist/matting-worker/matting-worker \
             -B -S -I -c "from multiprocessing.resource_tracker import main;main(0)" < /dev/null
 
-      - name: Ad-hoc sign
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-models-v1
+
+      - name: End-to-end run of the bundled worker with the real models
         run: |
-          codesign --force --deep --sign - dist/SubjectMatting.app
-          codesign --verify --verbose=2 dist/SubjectMatting.app
+          python -c "from PIL import Image, ImageDraw; im = Image.new('RGB', (320, 240), 'white'); ImageDraw.Draw(im).ellipse((90, 50, 230, 190), fill='red'); im.save('smoke.jpg')"
+          printf '{"id": 1, "cmd": "run", "src": "%s/smoke.jpg", "dst": "%s/smoke_out/smoke.png"}\n' "$PWD" "$PWD" \
+            | SUBJECTMATTING_LOG="$PWD/worker.log" perl -e 'alarm 1200; exec @ARGV' dist/matting-worker/matting-worker \
+            | tee events.jsonl || { tail -50 worker.log; exit 1; }
+          grep -q '"type": "result"' events.jsonl || { tail -50 worker.log; exit 1; }
+          python -c "from PIL import Image; im = Image.open('smoke_out/smoke.png'); assert im.mode == 'RGBA', im.mode; print(im.size, im.getextrema()[3])"
+
+      - name: Build and ad-hoc sign SubjectMatting.app
+        run: scripts/build_macos_app.sh
 
       - name: Zip
         run: |
           ditto -c -k --keepParent dist/SubjectMatting.app SubjectMatting-macos-arm64.zip
           ls -lh SubjectMatting-macos-arm64.zip
-          du -sh dist/SubjectMatting.app
 
       - uses: actions/upload-artifact@v4
         with:

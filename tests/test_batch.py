@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from matting.batch import default_output_dir, list_images, output_names, run_batch
+from matting.batch import default_output_dir, list_images, output_names, plan_jobs, run_batch
 
 
 def make_img(path: Path, color=(200, 50, 50)):
@@ -66,3 +66,51 @@ def test_run_batch_empty_folder_creates_nothing(tmp_path):
 def test_run_batch_missing_folder(tmp_path):
     with pytest.raises(FileNotFoundError):
         list(run_batch(FakePipe(), tmp_path / "nope", None))
+
+
+def test_plan_folder_goes_to_sibling_dir(tmp_path):
+    src = tmp_path / "photos"
+    src.mkdir()
+    make_img(src / "a.jpg")
+    make_img(src / "a.png")
+    make_img(src / "b.webp")
+    jobs, skipped = plan_jobs([src])
+    out = tmp_path / "photos_matting"
+    assert [(j.src.name, j.dst) for j in jobs] == [
+        ("a.jpg", out / "a_jpg.png"),
+        ("a.png", out / "a_png.png"),
+        ("b.webp", out / "b.png"),
+    ]
+    assert skipped == []
+
+
+def test_plan_loose_files_grouped_by_parent_and_deduplicated(tmp_path):
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    make_img(tmp_path / "x" / "a.jpg")
+    make_img(tmp_path / "y" / "b.jpg")
+    jobs, _ = plan_jobs([tmp_path / "x" / "a.jpg", tmp_path / "y" / "b.jpg", tmp_path / "x" / "a.jpg", tmp_path / "x"])
+    assert [j.dst for j in jobs] == [tmp_path / "x_matting" / "a.png", tmp_path / "y_matting" / "b.png"]
+
+
+def test_plan_shared_out_dir_disambiguates_across_folders(tmp_path):
+    for d in ("x", "y"):
+        (tmp_path / d).mkdir()
+        make_img(tmp_path / d / "a.jpg")
+    out = tmp_path / "out"
+    jobs, _ = plan_jobs([tmp_path / "x", tmp_path / "y"], out)
+    assert [j.dst for j in jobs] == [out / "a.png", out / "a_2.png"]
+
+
+def test_plan_skips_bad_inputs_and_output_equal_to_input(tmp_path):
+    make_img(tmp_path / "a.png")
+    (tmp_path / "notes.txt").write_text("x")
+    (tmp_path / "empty").mkdir()
+    jobs, skipped = plan_jobs([tmp_path / "notes.txt", tmp_path / "nope.jpg", tmp_path / "empty", tmp_path / "a.png"], tmp_path)
+    assert jobs == []
+    assert [(p.name, r) for p, r in skipped] == [
+        ("notes.txt", "不支持的格式"),
+        ("nope.jpg", "文件不存在"),
+        ("empty", "文件夹里没有图片"),
+        ("a.png", "输出文件夹不能和输入文件夹相同"),
+    ]
