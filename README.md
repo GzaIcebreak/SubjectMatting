@@ -33,6 +33,12 @@ SUBJECTMATTING_WORKER=".venv/bin/python worker.py" swift run --package-path maco
 测试：`swift test --package-path macos`。GitHub Actions（`.github/workflows/build-macos.yml`）跑完全部测试和一次真实模型的端到端抠图后打包；
 推 `v*` 标签会自动创建 Release。安装说明见 [packaging/RELEASE_NOTES.md](packaging/RELEASE_NOTES.md)（无开发者签名，首次打开需在「隐私与安全性」里点「仍要打开」）。
 
+## C++ 核心库（ONNX Runtime）
+
+不依赖 Python / PyTorch 的抠图核心，C 接口，可嵌入其他 app：见 [cpp/README.md](cpp/README.md)。
+本库 0.14 MB + ONNX Runtime 33 MB + fp16 模型 208 MB，结果与 Python 版逐像素一致。
+模型用 `scripts/export_onnx.py` 导出，Python 参考实现是 `matting/pipeline_onnx.py`（额外依赖见 `requirements-onnx.txt`）。
+
 ## 环境
 
 已建好：`.venv`（Python 3.12，torch CPU 版）。重建方法：

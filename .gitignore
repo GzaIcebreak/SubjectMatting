@@ -9,3 +9,6 @@ test_images/
 *.log
 .build/
 .superpowers/
+onnx_models/
+cpp/build/
+cpp/third_party/onnxruntime/

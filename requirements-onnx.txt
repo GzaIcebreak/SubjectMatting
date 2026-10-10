@@ -1,0 +1,7 @@
+# Extra tools for the ONNX export (scripts/export_onnx.py), the ONNX reference pipeline (matting/pipeline_onnx.py)
+# and building the C++ library (cpp/). Install on top of requirements.txt.
+onnx==1.23.2
+onnxruntime==1.31.0
+onnxscript==0.7.2
+cmake==4.4.4
+ninja==1.13.2
