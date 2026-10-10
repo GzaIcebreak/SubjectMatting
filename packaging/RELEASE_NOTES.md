@@ -2,6 +2,10 @@
 
 自动主体抠图：BiRefNet_lite 显著性 → SAM2.1-tiny 物体补全 → ViTMatte 发丝级 alpha。纯 CPU 运行。
 
+### v0.1.1 更新
+
+- 修复：打包后的 app 启动时不断重复启动自身（多进程辅助进程把整个应用又运行了一遍），导致一直卡在启动、页面打不开。v0.1.0 用户请升级。
+
 ### 安装与首次运行
 
 1. 下载 `SubjectMatting-macos-arm64.zip`，解压得到 `SubjectMatting.app`，拖到「应用程序」或任意目录。

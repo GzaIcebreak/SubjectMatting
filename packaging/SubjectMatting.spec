@@ -63,7 +63,7 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "SubjectMatting",
         "CFBundleDisplayName": "SubjectMatting",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": "0.1.1",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "14.0",
     },
