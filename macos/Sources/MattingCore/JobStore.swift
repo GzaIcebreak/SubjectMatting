@@ -293,3 +293,11 @@ public final class JobStore {
         return "未添加：" + shown.joined(separator: "、") + more
     }
 }
+
+extension JobStore {
+    /// The selected job's result file, when it has one.
+    public var selectedResult: URL? {
+        guard let job = jobs.first(where: { $0.id == selection }), case .done = job.status else { return nil }
+        return job.dst
+    }
+}

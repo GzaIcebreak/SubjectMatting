@@ -12,6 +12,7 @@ struct ContentView: View {
             List(selection: $store.selection) {
                 ForEach(store.jobs) { job in
                     JobRow(job: job).tag(job.id)
+                        .contextMenu { JobContextMenu(job: job) }
                 }
             }
             .safeAreaInset(edge: .bottom) { StatusFooter().padding(10) }
@@ -82,6 +83,19 @@ struct Toolbar: ToolbarContent {
                     .help("重新处理已停止和失败的图片")
             }
 
+            Menu {
+                Button("另存为…") { Panels.saveSelected(of: store) }
+                    .disabled(store.selectedResult == nil)
+                Button("导出全部结果（\(store.doneCount) 张）…") { Panels.exportAll(of: store) }
+                    .disabled(store.doneCount == 0)
+            } label: {
+                Label("保存", systemImage: "square.and.arrow.down")
+            } primaryAction: {
+                Panels.saveSelected(of: store)
+            }
+            .disabled(store.doneCount == 0)
+            .help("另存为：把选中的结果保存到其他位置（结果已经自动保存）；点箭头可导出全部")
+
             Button {
                 if let job = selectedJob { revealInFinder(job) }
             } label: { Label("在访达中显示", systemImage: "magnifyingglass") }
@@ -94,12 +108,28 @@ struct Toolbar: ToolbarContent {
         }
     }
 
-    private func revealInFinder(_ job: Job) {
-        if case .done = job.status, FileManager.default.fileExists(atPath: job.dst.path) {
-            NSWorkspace.shared.activateFileViewerSelecting([job.dst])
-        } else {
-            NSWorkspace.shared.activateFileViewerSelecting([job.src])
+}
+
+func revealInFinder(_ job: Job) {
+    if case .done = job.status, FileManager.default.fileExists(atPath: job.dst.path) {
+        NSWorkspace.shared.activateFileViewerSelecting([job.dst])
+    } else {
+        NSWorkspace.shared.activateFileViewerSelecting([job.src])
+    }
+}
+
+struct JobContextMenu: View {
+    @Environment(JobStore.self) private var store
+    let job: Job
+
+    var body: some View {
+        let done: Bool = { if case .done = job.status { return true } else { return false } }()
+        Button("另存为…") {
+            store.selection = job.id
+            Panels.saveSelected(of: store)
         }
+        .disabled(!done)
+        Button("在访达中显示") { revealInFinder(job) }
     }
 }
 
@@ -275,7 +305,7 @@ struct InfoBar: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(job.src.lastPathComponent).font(.headline).lineLimit(1)
-                Text("→ \(job.dst.path)").font(.caption).foregroundStyle(.secondary)
+                Text(dstText).font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
             }
             Spacer()
@@ -288,6 +318,11 @@ struct InfoBar: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var dstText: String {
+        if case .done = job.status { return "已自动保存到：\(job.dst.path)" }
+        return "将保存到：\(job.dst.path)"
     }
 
     private func stageText(_ stages: [String: Double]) -> String {

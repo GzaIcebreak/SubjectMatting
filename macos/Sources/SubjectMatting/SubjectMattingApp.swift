@@ -40,6 +40,14 @@ struct SubjectMattingApp: App {
                 Button("添加图片或文件夹…") { Panels.addFiles(to: store) }
                     .keyboardShortcut("o")
             }
+            CommandGroup(replacing: .saveItem) {
+                Button("另存为…") { Panels.saveSelected(of: store) }
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
+                    .disabled(store.selectedResult == nil)
+                Button("导出全部结果…") { Panels.exportAll(of: store) }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(store.doneCount == 0)
+            }
         }
     }
 }
@@ -54,6 +62,41 @@ enum Panels {
         panel.prompt = "添加"
         if panel.runModal() == .OK {
             store.add(panel.urls)
+        }
+    }
+
+    /// Results are already auto-saved to job.dst; this copies the selected one somewhere else.
+    static func saveSelected(of store: JobStore) {
+        guard let result = store.selectedResult else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = result.lastPathComponent
+        panel.directoryURL = result.deletingLastPathComponent()
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try ResultExport.save(result, to: url)
+        } catch {
+            store.notice = "另存失败：\(error.localizedDescription)"
+        }
+    }
+
+    static func exportAll(of store: JobStore) {
+        let results = ResultExport.finishedResults(store.jobs)
+        guard !results.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "导出到这里"
+        panel.message = "把 \(results.count) 张抠图结果复制到这个文件夹（同名文件不会被覆盖）"
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        let r = ResultExport.exportAll(results, to: folder)
+        store.notice = r.errors.isEmpty
+            ? "已导出 \(r.copied) 张到 \(folder.lastPathComponent)"
+            : "已导出 \(r.copied) 张，失败 \(r.errors.count) 张：\(r.errors.prefix(2).joined(separator: "；"))"
+        if r.copied > 0 {
+            NSWorkspace.shared.activateFileViewerSelecting([folder])
         }
     }
 

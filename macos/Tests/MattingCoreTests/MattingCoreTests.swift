@@ -175,3 +175,55 @@ final class JobStoreTests: XCTestCase {
         XCTAssertEqual(transports.count, 1)
     }
 }
+
+final class ResultExportTests: XCTestCase {
+    var dir: URL!
+
+    override func setUpWithError() throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("a"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("b"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("out"), withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    func write(_ path: String, _ text: String) throws -> URL {
+        let url = dir.appendingPathComponent(path)
+        try Data(text.utf8).write(to: url)
+        return url
+    }
+
+    func testOnlyFinishedJobsAreExported() {
+        let jobs = [
+            Job(id: UUID(), src: URL(fileURLWithPath: "/x.jpg"), dst: URL(fileURLWithPath: "/m/x.png"), status: .done(total: 1, stages: [:])),
+            Job(id: UUID(), src: URL(fileURLWithPath: "/y.jpg"), dst: URL(fileURLWithPath: "/m/y.png"), status: .failed("bad")),
+            Job(id: UUID(), src: URL(fileURLWithPath: "/z.jpg"), dst: URL(fileURLWithPath: "/m/z.png"), status: .queued),
+        ]
+        XCTAssertEqual(ResultExport.finishedResults(jobs).map(\.path), ["/m/x.png"])
+    }
+
+    func testSaveReplacesExistingFile() throws {
+        let src = try write("a/cat.png", "new")
+        let dst = try write("out/cat.png", "old")
+        try ResultExport.save(src, to: dst)
+        XCTAssertEqual(try String(contentsOf: dst, encoding: .utf8), "new")
+        try ResultExport.save(src, to: src)  // saving onto itself is a no-op, not a deletion
+        XCTAssertEqual(try String(contentsOf: src, encoding: .utf8), "new")
+    }
+
+    func testExportAllNeverOverwrites() throws {
+        let a = try write("a/cat.png", "a")
+        let b = try write("b/cat.png", "b")
+        _ = try write("out/cat.png", "existing")
+        let r = ResultExport.exportAll([a, b, dir.appendingPathComponent("missing.png")], to: dir.appendingPathComponent("out"))
+        XCTAssertEqual(r.copied, 2)
+        XCTAssertEqual(r.errors.count, 1)
+        let out = dir.appendingPathComponent("out")
+        XCTAssertEqual(try String(contentsOf: out.appendingPathComponent("cat.png"), encoding: .utf8), "existing")
+        XCTAssertEqual(try String(contentsOf: out.appendingPathComponent("cat_2.png"), encoding: .utf8), "a")
+        XCTAssertEqual(try String(contentsOf: out.appendingPathComponent("cat_3.png"), encoding: .utf8), "b")
+    }
+}

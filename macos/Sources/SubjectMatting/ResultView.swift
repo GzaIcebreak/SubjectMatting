@@ -16,6 +16,9 @@ struct ResultView: View {
             if let image {
                 if result != nil {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).background(Checkerboard())
+                        // Drag the PNG out to Finder or another app.
+                        .onDrag { NSItemProvider(contentsOf: result) ?? NSItemProvider() }
+                        .help("可以把结果直接拖到访达或其他应用")
                 } else {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).opacity(0.35)
                 }
