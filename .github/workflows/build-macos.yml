@@ -37,6 +37,13 @@ jobs:
       - name: Self-test the bundle (imports only, no model download)
         run: SUBJECTMATTING_SELFTEST=1 dist/SubjectMatting.app/Contents/MacOS/SubjectMatting
 
+      - name: Multiprocessing helper exits instead of relaunching the app
+        # The bundle re-executes itself for multiprocessing's resource_tracker. Without freeze_support() that
+        # child runs the whole app (loads models, never exits) and the 60s alarm fails this step.
+        run: |
+          perl -e 'alarm 60; exec @ARGV' dist/SubjectMatting.app/Contents/MacOS/SubjectMatting \
+            -B -S -I -c "from multiprocessing.resource_tracker import main;main(0)" < /dev/null
+
       - name: Ad-hoc sign
         run: |
           codesign --force --deep --sign - dist/SubjectMatting.app

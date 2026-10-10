@@ -8,10 +8,17 @@ Env vars:
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 import time
 from pathlib import Path
+
+if __name__ == "__main__":
+    # Must run before anything else. In a PyInstaller bundle, multiprocessing helpers (resource_tracker,
+    # spawn workers) are started by re-executing this binary; without this they re-run the whole app,
+    # each loading the models and spawning more helpers -> endless restarts, the UI never comes up.
+    multiprocessing.freeze_support()
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
