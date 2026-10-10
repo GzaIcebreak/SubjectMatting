@@ -1,5 +1,10 @@
 # 原生 macOS 界面设计
 
+> **2026-10-10 更新：** 抠图进程已从 PyInstaller 打包的 `worker.py` 换成 Swift 写的 `matting-worker`，
+> 调用 C++ 核心库（`cpp/`，ONNX Runtime + fp16 模型，模型内置在 app 里，不再下载）。协议不变；
+> 输出路径规则同时有 Python（`matting/batch.py`）和 Swift（`MattingCore/JobPlanner.swift`）两份，测试用例相同。
+> 下文关于 PyInstaller 和模型下载的部分只对 `worker.py` 仍然成立。
+
 日期：2026-10-10
 
 ## 目标

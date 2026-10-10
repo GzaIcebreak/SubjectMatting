@@ -9,79 +9,13 @@ permissions:
   contents: write
 
 jobs:
-  app:
+  build:
     runs-on: macos-latest # Apple Silicon (arm64)
     timeout-minutes: 60
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       GRADIO_ANALYTICS_ENABLED: "False"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install -r requirements.txt pyinstaller
-          python -c "import platform, torch; print(platform.machine(), torch.__version__)"
-
-      - name: Unit tests
-        run: python -m pytest tests -q
-
-      - name: Swift tests
-        run: swift test --package-path macos
-
-      - name: Build worker
-        run: pyinstaller --noconfirm --clean packaging/worker.spec
-
-      - name: Self-test the worker (imports only, no model download)
-        run: SUBJECTMATTING_SELFTEST=1 dist/matting-worker/matting-worker
-
-      - name: Multiprocessing helper exits instead of relaunching the worker
-        # The bundle re-executes itself for multiprocessing's resource_tracker. Without freeze_support() that
-        # child runs the whole worker (loads models, never exits) and the 60s alarm fails this step.
-        run: |
-          perl -e 'alarm 60; exec @ARGV' dist/matting-worker/matting-worker \
-            -B -S -I -c "from multiprocessing.resource_tracker import main;main(0)" < /dev/null
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface/hub
-          key: hf-models-v1
-
-      - name: End-to-end run of the bundled worker with the real models
-        run: |
-          python -c "from PIL import Image, ImageDraw; im = Image.new('RGB', (320, 240), 'white'); ImageDraw.Draw(im).ellipse((90, 50, 230, 190), fill='red'); im.save('smoke.jpg')"
-          printf '{"id": 1, "cmd": "run", "src": "%s/smoke.jpg", "dst": "%s/smoke_out/smoke.png"}\n' "$PWD" "$PWD" \
-            | SUBJECTMATTING_LOG="$PWD/worker.log" perl -e 'alarm 1200; exec @ARGV' dist/matting-worker/matting-worker \
-            | tee events.jsonl || { tail -50 worker.log; exit 1; }
-          grep -q '"type": "result"' events.jsonl || { tail -50 worker.log; exit 1; }
-          python -c "from PIL import Image; im = Image.open('smoke_out/smoke.png'); assert im.mode == 'RGBA', im.mode; print(im.size, im.getextrema()[3])"
-
-      - name: Build and ad-hoc sign SubjectMatting.app
-        run: scripts/build_macos_app.sh
-
-      - name: Zip
-        run: |
-          ditto -c -k --keepParent dist/SubjectMatting.app SubjectMatting-macos-arm64.zip
-          ls -lh SubjectMatting-macos-arm64.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SubjectMatting-macos-arm64
-          path: SubjectMatting-macos-arm64.zip
-          compression-level: 0 # already a zip
-          retention-days: 14
-
-  core:
-    # C++ library on ONNX Runtime (cpp/): export the models, build, check against the Python reference, package.
-    runs-on: macos-latest
-    timeout-minutes: 60
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      ORT_DISABLE_TELEMETRY: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -93,19 +27,25 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt -r requirements-onnx.txt
 
+      - name: Python tests
+        run: python -m pytest tests -q
+
+      - name: Swift tests
+        run: swift test --package-path macos
+
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub
           key: hf-models-v1
 
       - name: Download the PyTorch models
-        # worker.py fetches exactly the files the pipeline loads, with progress; the export then runs offline.
+        # worker.py fetches exactly the files the pipeline loads; the export then runs offline.
         run: echo -n | SUBJECTMATTING_LOG="$PWD/worker.log" python worker.py
 
       - name: Export ONNX models
         run: PYTHONPATH=. python scripts/export_onnx.py
 
-      - name: Build
+      - name: Build the C++ library
         run: |
           cpp/scripts/fetch_onnxruntime.sh
           cmake -S cpp -B cpp/build -G Ninja -DONNXRUNTIME_DIR="$PWD/cpp/third_party/onnxruntime"
@@ -119,19 +59,36 @@ jobs:
       - name: C++ pipeline matches the Python ONNX reference
         run: python cpp/tests/parity.py --cli cpp/build/sm_cli --models onnx_models
 
-      - name: Package SDK
-        run: cpp/scripts/package_sdk.sh
+      - name: Build and ad-hoc sign SubjectMatting.app
+        run: scripts/build_macos_app.sh
+
+      - name: End-to-end run of the app's matting-worker
+        run: |
+          python -c "from PIL import Image, ImageDraw; im = Image.new('RGB', (320, 240), 'white'); ImageDraw.Draw(im).ellipse((90, 50, 230, 190), fill='red'); im.save('smoke.jpg')"
+          printf '{"id": 1, "cmd": "run", "src": "%s/smoke.jpg", "dst": "%s/smoke_out/smoke.png"}\n' "$PWD" "$PWD" \
+            | SUBJECTMATTING_LOG="$PWD/worker.log" perl -e 'alarm 300; exec @ARGV' dist/SubjectMatting.app/Contents/MacOS/matting-worker \
+            | tee events.jsonl || { tail -50 worker.log; exit 1; }
+          grep -q '"type":"result"' events.jsonl || { tail -50 worker.log; exit 1; }
+          python -c "from PIL import Image; im = Image.open('smoke_out/smoke.png'); assert im.mode == 'RGBA', im.mode; print(im.size, im.getextrema()[3])"
+
+      - name: Zip
+        run: |
+          ditto -c -k --keepParent dist/SubjectMatting.app dist/SubjectMatting-macos-arm64.zip
+          cpp/scripts/package_sdk.sh
+          ls -lh dist/*.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SubjectMatting-core-darwin-arm64
-          path: dist/SubjectMatting-core-darwin-arm64.zip
-          compression-level: 0
+          name: SubjectMatting-macos-arm64
+          path: |
+            dist/SubjectMatting-macos-arm64.zip
+            dist/SubjectMatting-core-darwin-arm64.zip
+          compression-level: 0 # already zips
           retention-days: 14
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [app, core]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

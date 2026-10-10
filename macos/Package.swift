@@ -9,6 +9,8 @@ let package = Package(
         .target(name: "MattingCore"),
         // The SwiftUI app. scripts/build_macos_app.sh wraps the binary in SubjectMatting.app.
         .executableTarget(name: "SubjectMatting", dependencies: ["MattingCore"]),
+        // The matting process the app starts: JSON lines over stdin/stdout, libsubject_matting (cpp/) via dlopen.
+        .executableTarget(name: "matting-worker", dependencies: ["MattingCore"], path: "Sources/MattingWorker"),
         .testTarget(name: "MattingCoreTests", dependencies: ["MattingCore"]),
     ]
 )

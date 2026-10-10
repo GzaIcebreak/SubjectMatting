@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -31,6 +32,14 @@ sm_context *sm_create(const char *models_dir, const char *precision, int num_thr
         set_error(err, err_len, "models_dir is NULL");
         return nullptr;
     }
+    // Official ONNX Runtime builds start Microsoft's 1DS telemetry (a device id file under ~/Library/Application
+    // Support/Microsoft and an uploader thread) unless this is set before the first OrtEnv. A host app that wants
+    // telemetry can set it to 0 itself.
+#ifdef _WIN32
+    if (!std::getenv("ORT_DISABLE_TELEMETRY")) _putenv_s("ORT_DISABLE_TELEMETRY", "1");
+#else
+    setenv("ORT_DISABLE_TELEMETRY", "1", 0);
+#endif
     try {
         return new sm_context(models_dir, precision && *precision ? precision : "fp16", num_threads);
     } catch (const std::exception &e) {

@@ -6,11 +6,16 @@ plain PIL/numpy operations instead of the Hugging Face processors. The mask logi
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
 import numpy as np
-import onnxruntime as ort
+
+# Official onnxruntime builds start Microsoft telemetry unless this is set before the first session.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
+import onnxruntime as ort  # noqa: E402
 from PIL import Image
 
 from .common import compose_rgba, make_trimap, resize_long_side

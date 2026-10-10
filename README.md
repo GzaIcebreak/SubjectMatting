@@ -9,29 +9,38 @@ CPU（Ultra 7 265K）上平均约 4.3s/张。设计见 [docs/2026-10-09-subject-
 
 ## macOS app（Apple Silicon）
 
-原生 SwiftUI 窗口 + 后台 Python 抠图进程（设计见 [docs/superpowers/specs/2026-10-10-native-macos-app-design.md](docs/superpowers/specs/2026-10-10-native-macos-app-design.md)）：
+原生 SwiftUI 窗口，抠图在后台进程 `matting-worker` 里用 C++ 核心库（见下一节）完成，fp16 模型打包在 app 内，
+离线可用，整个 app 约 232 MB。设计见 [docs/superpowers/specs/2026-10-10-native-macos-app-design.md](docs/superpowers/specs/2026-10-10-native-macos-app-design.md)。
 
-- `macos/`：Swift Package。`MattingCore`（与 worker 的 JSON 协议、处理队列）+ `SubjectMatting`（界面）。
-- `worker.py`：抠图进程，stdin/stdout 每行一条 JSON，复用 `matting/`。用 `packaging/worker.spec` 打包。
+- `macos/`：Swift Package。`MattingCore`（协议、处理队列、输出路径规则）、`SubjectMatting`（界面）、
+  `matting-worker`（stdin/stdout 每行一条 JSON，dlopen 调用 `libsubject_matting`，ImageIO 读写图片）。
+- `worker.py`：同一协议的 Python/PyTorch 参考实现，开发调试用。
 - `scripts/build_macos_app.sh`：组装 `dist/SubjectMatting.app` 并 ad-hoc 签名。
 
-本机构建：
+本机构建（依赖见下一节和 `requirements-onnx.txt`）：
 
 ```bash
-.venv/bin/pyinstaller --noconfirm --clean packaging/worker.spec
+PYTHONPATH=. .venv/bin/python scripts/export_onnx.py
+```
+```bash
+cpp/scripts/fetch_onnxruntime.sh
+```
+```bash
+cmake -S cpp -B cpp/build -DONNXRUNTIME_DIR=$PWD/cpp/third_party/onnxruntime && cmake --build cpp/build
 ```
 ```bash
 scripts/build_macos_app.sh
 ```
 
-开发时不打包，直接用源码里的 worker 运行界面（在仓库根目录执行）：
+开发时不打包，直接运行界面（在仓库根目录执行）：
 
 ```bash
-SUBJECTMATTING_WORKER=".venv/bin/python worker.py" swift run --package-path macos SubjectMatting
+SUBJECTMATTING_WORKER="macos/.build/debug/matting-worker --lib cpp/build/libsubject_matting.dylib --models onnx_models" swift run --package-path macos SubjectMatting
 ```
 
-测试：`swift test --package-path macos`。GitHub Actions（`.github/workflows/build-macos.yml`）跑完全部测试和一次真实模型的端到端抠图后打包；
-推 `v*` 标签会自动创建 Release。安装说明见 [packaging/RELEASE_NOTES.md](packaging/RELEASE_NOTES.md)（无开发者签名，首次打开需在「隐私与安全性」里点「仍要打开」）。
+测试：`swift test --package-path macos`。GitHub Actions（`.github/workflows/build-macos.yml`）跑完全部测试、C++ 对照测试和
+一次打包后 worker 的端到端抠图后打包；推 `v*` 标签会自动创建 Release（app + C++ SDK 两个压缩包）。
+安装说明见 [packaging/RELEASE_NOTES.md](packaging/RELEASE_NOTES.md)（无开发者签名，首次打开需在「隐私与安全性」里点「仍要打开」）。
 
 ## C++ 核心库（ONNX Runtime）
 

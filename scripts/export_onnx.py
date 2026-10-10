@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")  # onnxruntime is used for int8 quantization
 
 import numpy as np  # noqa: E402
 import onnx  # noqa: E402

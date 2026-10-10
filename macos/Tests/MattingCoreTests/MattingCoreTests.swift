@@ -227,3 +227,58 @@ final class ResultExportTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: out.appendingPathComponent("cat_3.png"), encoding: .utf8), "b")
     }
 }
+
+/// The same cases as tests/test_batch.py::test_plan_* for the Python planner.
+final class JobPlannerTests: XCTestCase {
+    var tmp: URL!
+
+    override func setUpWithError() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        tmp = JobPlanner.resolved(dir)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: tmp)
+    }
+
+    func touch(_ path: String) throws {
+        let url = tmp.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([0]).write(to: url)
+    }
+
+    func p(_ path: String) -> String { tmp.appendingPathComponent(path).path }
+
+    func testFolderGoesToSiblingDir() throws {
+        for f in ["photos/a.jpg", "photos/a.png", "photos/b.webp", "photos/notes.txt", "photos/sub/c.jpg"] { try touch(f) }
+        let (jobs, skipped) = JobPlanner.plan([p("photos")], outputDir: nil)
+        XCTAssertEqual(jobs.map(\.dst), [p("photos_matting/a_jpg.png"), p("photos_matting/a_png.png"), p("photos_matting/b.png")])
+        XCTAssertEqual(jobs.map { URL(fileURLWithPath: $0.src).lastPathComponent }, ["a.jpg", "a.png", "b.webp"])
+        XCTAssertEqual(skipped, [])
+    }
+
+    func testLooseFilesGroupedByParentAndDeduplicated() throws {
+        try touch("x/a.jpg")
+        try touch("y/b.jpg")
+        let (jobs, _) = JobPlanner.plan([p("x/a.jpg"), p("y/b.jpg"), p("x/a.jpg"), p("x")], outputDir: nil)
+        XCTAssertEqual(jobs.map(\.dst), [p("x_matting/a.png"), p("y_matting/b.png")])
+    }
+
+    func testSharedOutputDirDisambiguatesAcrossFolders() throws {
+        try touch("x/a.jpg")
+        try touch("y/a.jpg")
+        let (jobs, _) = JobPlanner.plan([p("x"), p("y")], outputDir: p("out"))
+        XCTAssertEqual(jobs.map(\.dst), [p("out/a.png"), p("out/a_2.png")])
+    }
+
+    func testSkipsBadInputsAndOutputEqualToInput() throws {
+        try touch("a.png")
+        try touch("notes.txt")
+        try FileManager.default.createDirectory(at: tmp.appendingPathComponent("empty"), withIntermediateDirectories: true)
+        let (jobs, skipped) = JobPlanner.plan([p("notes.txt"), p("nope.jpg"), p("empty"), p("a.png")], outputDir: tmp.path)
+        XCTAssertEqual(jobs, [])
+        XCTAssertEqual(skipped.map { URL(fileURLWithPath: $0.path).lastPathComponent }, ["notes.txt", "nope.jpg", "empty", "a.png"])
+        XCTAssertEqual(skipped.map(\.reason), ["不支持的格式", "文件不存在", "文件夹里没有图片", "输出文件夹不能和输入文件夹相同"])
+    }
+}

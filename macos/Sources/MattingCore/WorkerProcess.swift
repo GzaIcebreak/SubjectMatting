@@ -11,7 +11,7 @@ public protocol WorkerTransport: AnyObject {
     func stop()
 }
 
-/// Runs the bundled matting-worker (or $SUBJECTMATTING_WORKER during development) as a child process.
+/// Runs the bundled matting-worker (Contents/MacOS, see Sources/MattingWorker) or $SUBJECTMATTING_WORKER.
 public final class WorkerProcess: WorkerTransport {
     public var onEvent: ((WorkerEvent) -> Void)?
     public var onExit: ((Int32) -> Void)?
@@ -23,15 +23,17 @@ public final class WorkerProcess: WorkerTransport {
 
     public init() {}
 
-    /// $SUBJECTMATTING_WORKER is a command line such as ".venv/bin/python worker.py", run from the current
-    /// directory; otherwise the PyInstaller build inside the app bundle.
+    /// $SUBJECTMATTING_WORKER is a command line run from the current directory, e.g.
+    /// "macos/.build/debug/matting-worker --lib cpp/build/libsubject_matting.dylib --models onnx_models"
+    /// or the Python reference ".venv/bin/python worker.py".
     static func command() -> (URL, [String]) {
         if let dev = ProcessInfo.processInfo.environment["SUBJECTMATTING_WORKER"], !dev.isEmpty {
             let parts = dev.split(separator: " ").map(String.init)
             let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             return (URL(fileURLWithPath: parts[0], relativeTo: cwd).absoluteURL, Array(parts.dropFirst()))
         }
-        let exe = Bundle.main.resourceURL!.appendingPathComponent("worker/matting-worker")
+        let exe = Bundle.main.url(forAuxiliaryExecutable: "matting-worker")
+            ?? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/matting-worker")
         return (exe, [])
     }
 
