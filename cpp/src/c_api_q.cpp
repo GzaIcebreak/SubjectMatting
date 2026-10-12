@@ -79,6 +79,31 @@ int smq_matte(smq_context *ctx, const uint8_t *rgb, int width, int height, int s
     return SMQ_ERROR;
 }
 
+int smq_matte_plain(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, uint8_t *out_rgba,
+                    smq_timings *timings, char *err, size_t err_len) {
+    if (!ctx || !rgb || !out_rgba || width <= 0 || height <= 0 || stride < width * 3) {
+        set_error(err, err_len, "invalid arguments");
+        return SMQ_INVALID_ARGUMENTS;
+    }
+    try {
+        sm::ImageU8 img(width, height, 3);
+        for (int y = 0; y < height; y++) std::memcpy(img.row(y), rgb + size_t(y) * stride, size_t(width) * 3);
+        sm::TimingsQ t;
+        sm::ImageU8 out = ctx->pipeline.run_plain(img, &t);
+        std::memcpy(out_rgba, out.data.data(), out.data.size());
+        if (timings) *timings = {t.sam3, t.matting, t.total};
+        return SMQ_OK;
+    } catch (const sm::NotPlain &e) {
+        set_error(err, err_len, e.what());
+        return SMQ_NOT_PLAIN;
+    } catch (const std::exception &e) {
+        set_error(err, err_len, e.what());
+    } catch (...) {
+        set_error(err, err_len, "unknown error");
+    }
+    return SMQ_ERROR;
+}
+
 void smq_destroy(smq_context *ctx) { delete ctx; }
 
 }  // extern "C"

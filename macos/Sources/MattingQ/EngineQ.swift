@@ -31,10 +31,15 @@ public final class MattingEngineQ {
         OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeRawPointer?, Int32, UnsafeMutablePointer<UInt8>?,
         UnsafeMutableRawPointer?, UnsafeMutablePointer<CChar>?, Int
     ) -> Int32
+    private typealias MattePlain = @convention(c) (
+        OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeMutablePointer<UInt8>?, UnsafeMutableRawPointer?,
+        UnsafeMutablePointer<CChar>?, Int
+    ) -> Int32
     private typealias Destroy = @convention(c) (OpaquePointer?) -> Void
 
     private let handle: UnsafeMutableRawPointer
     private let matteFn: Matte
+    private let mattePlainFn: MattePlain
     private let destroyFn: Destroy
     private let ctx: OpaquePointer
 
@@ -49,6 +54,7 @@ public final class MattingEngineQ {
         handle = h
         let create = try symbol("smq_create", as: Create.self)
         matteFn = try symbol("smq_matte", as: Matte.self)
+        mattePlainFn = try symbol("smq_matte_plain", as: MattePlain.self)
         destroyFn = try symbol("smq_destroy", as: Destroy.self)
         var err = [CChar](repeating: 0, count: 512)
         let errLen = err.count
@@ -60,6 +66,23 @@ public final class MattingEngineQ {
 
     deinit {
         destroyFn(ctx)
+    }
+
+    /// Auto mode on a solid background (no Qwen, no SAM3): nil when the background is not a plain colour.
+    /// timings.sam3 holds the keying time.
+    public func mattePlain(rgb: [UInt8], width: Int, height: Int) throws -> (rgba: [UInt8], timings: Timings)? {
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        var timings = Timings()
+        var err = [CChar](repeating: 0, count: 512)
+        let errLen = err.count
+        let status = withUnsafeMutableBytes(of: &timings) { t in
+            mattePlainFn(ctx, rgb, Int32(width), Int32(height), Int32(width * 3), &rgba, t.baseAddress, &err, errLen)
+        }
+        switch status {
+        case 0: return (rgba, timings)
+        case 4: return nil
+        default: throw Failure.other(String(cString: err))
+        }
     }
 
     /// subjects: label + box in pixels of the image. Returns width*height*4 RGBA bytes.

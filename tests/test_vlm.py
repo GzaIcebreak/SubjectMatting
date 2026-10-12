@@ -96,3 +96,22 @@ def test_drop_duplicates_keeps_disjoint_objects_and_drops_contained_ones():
     inst.scores = np.array([0.9, 0.3, 0.8])
     # #1 is mostly inside #0 (cat + a strip of blanket); #2 is a separate bag.
     assert drop_duplicates(inst, [0, 1, 2]) == [0, 2]
+
+
+def test_plain_background_keys_out_everything_else_and_rejects_busy_borders():
+    from PIL import Image as PILImage
+
+    from matting.plain_background import key_mask, plain_background
+
+    a = np.full((200, 300, 3), 250, np.uint8)
+    a[60:150, 80:200] = (120, 90, 60)  # the object
+    a[150:170, 70:210] = (90, 50, 30)  # its base, a different colour
+    a[5, 5] = (0, 0, 0)  # a speck
+    img = PILImage.fromarray(a)
+    bg = plain_background(img)
+    assert bg is not None and list(bg) == [250, 250, 250]
+    m = key_mask(img, bg)
+    assert m[100, 100] and m[160, 100]  # object and base both kept
+    assert not m[5, 5] and not m[10, 280]
+    busy = np.random.default_rng(0).integers(0, 255, (200, 300, 3), np.uint8)
+    assert plain_background(PILImage.fromarray(busy)) is None

@@ -18,6 +18,7 @@ from PIL import Image
 
 from .common import ViTMatte, compose_rgba, largest_components, make_trimap, resize_long_side
 from .pipeline_a import SAFETY_PAD, fuse_masks, pad_box
+from .plain_background import key_mask, plain_background
 from .qwen import Detection, QwenDetector, Subject
 from .sam3 import EfficientSam3, Instances
 
@@ -121,6 +122,16 @@ class PipelineVlm:
         stages: dict[str, float] = {}
         work = resize_long_side(img)
 
+        if instruction is None:
+            # Solid background: the subject is everything that isn't background; no Qwen, no SAM3.
+            t = time.perf_counter()
+            bg = plain_background(work)
+            mask = key_mask(work, bg) if bg is not None else None
+            stages["key"] = time.perf_counter() - t
+            if mask is not None and mask.any():
+                return self._matte(img, work, mask, stages, {"detection": None, "choices": [], "background": bg})
+            del stages["key"]
+
         t = time.perf_counter()
         det: Detection = self.detector.detect(work, instruction)
         stages["qwen"] = time.perf_counter() - t
@@ -142,16 +153,12 @@ class PipelineVlm:
         if not mask.any():
             raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
 
+        return self._matte(img, work, mask, stages, {"detection": det, "choices": choices})
+
+    def _matte(self, img, work, mask, stages, extra) -> tuple[Image.Image, dict]:
         t = time.perf_counter()
         trimap = make_trimap(mask)
         alpha = self.matte(work, trimap)
         stages["matting"] = time.perf_counter() - t
-        info = {
-            "stages": stages,
-            "total": sum(stages.values()),
-            "detection": det,
-            "choices": choices,
-            "mask": mask,
-            "trimap": trimap,
-        }
+        info = {"stages": stages, "total": sum(stages.values()), "mask": mask, "trimap": trimap, **extra}
         return compose_rgba(img, alpha), info

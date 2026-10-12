@@ -124,6 +124,15 @@ while let msg = runs.take() {
             throw ImageFiles.Failure(description: "run 命令缺少 src/dst")
         }
         let img = try ImageFiles.loadRGB(URL(fileURLWithPath: src))
+        let dstURL = URL(fileURLWithPath: dst)
+        try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Auto mode on a solid background: everything that isn't background is the subject. No Qwen, no SAM3.
+        if instruction == nil, let (rgba, t) = try engine.mattePlain(rgb: img.pixels, width: img.width, height: img.height) {
+            FileHandle.standardError.write("\(URL(fileURLWithPath: src).lastPathComponent): plain background\n".data(using: .utf8)!)
+            try ImageFiles.writePNG(rgba: rgba, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dstURL)
+            send(["type": "result", "id": id, "dst": dst, "total": t.total, "stages": ["key": t.sam3, "matting": t.matting]])
+            continue
+        }
         let t0 = Date()
         let subjects = try qwen.detect(jpeg: try ImageFiles.jpegForUpload(img), width: img.width, height: img.height, instruction: instruction)
         let qwenSeconds = Date().timeIntervalSince(t0)
@@ -132,8 +141,6 @@ while let msg = runs.take() {
             throw ImageFiles.Failure(description: instruction.map { "图中没找到：\($0)" } ?? "没有识别到主体")
         }
         let (rgba, t) = try engine.matte(rgb: img.pixels, width: img.width, height: img.height, subjects: subjects)
-        let dstURL = URL(fileURLWithPath: dst)
-        try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try ImageFiles.writePNG(rgba: rgba, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dstURL)
         send([
             "type": "result", "id": id, "dst": dst, "total": qwenSeconds + t.total,

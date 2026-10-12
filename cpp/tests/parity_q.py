@@ -61,13 +61,15 @@ def main() -> int:
     ap.add_argument("--cache", default="outputs/bench_vlm/qwen_cache.json")
     ap.add_argument("--max-mean", type=float, default=0.5)
     ap.add_argument("--min-iou", type=float, default=0.99)
+    ap.add_argument("--plain-only", action="store_true", help="skip the cached subject cases")
+    ap.add_argument("--plain", nargs="*", default=[], help="solid-background images for the fast path (default: synthetic)")
     args = ap.parse_args()
 
     tmp = Path(tempfile.mkdtemp())
     det = FixedDetector()
     ref = PipelineVlmOnnx(args.models, args.precision, detector=det)
     failed = total = 0
-    for png, subjects in cases(Path(args.cache), tmp):
+    for png, subjects in (cases(Path(args.cache), tmp) if not args.plain_only else []):
         img = Image.open(png).convert("RGB")
         work = resize_long_side(img)
         det.subjects = subjects
@@ -89,6 +91,34 @@ def main() -> int:
         ok = mean <= args.max_mean and iou >= args.min_iou
         failed += not ok
         print(f"{'PASS' if ok else 'FAIL'} {png.stem:22s} mean|diff| {mean:.4f}/255  IoU {iou:.5f}  max {np.abs(a - b).max():.0f}  {r.stdout.split('  ')[-1].strip()}")
+    # Plain-background fast path (auto mode, no subjects): solid-background images, synthetic if none are given.
+    plain = [Path(p) for p in args.plain] or []
+    if not plain:
+        for i, (w, h) in enumerate([(700, 500), (900, 900)]):
+            im = Image.new("RGB", (w, h), (252, 252, 250))
+            d = ImageDraw.Draw(im)
+            d.ellipse((w * 0.3, h * 0.15, w * 0.7, h * 0.7), fill=(170, 140, 90))
+            d.rectangle((w * 0.2, h * 0.68, w * 0.8, h * 0.8), fill=(90, 50, 30))
+            plain.append(tmp / f"plain_{i}.png")
+            im.save(plain[-1])
+    for src in plain:
+        png = tmp / f"plain_in_{src.stem}.png"
+        load_rgb(src).save(png)
+        img = Image.open(png).convert("RGB")
+        a = np.asarray(ref.run(img)[0])[..., 3].astype(np.float64)  # auto mode -> plain path
+        out = tmp / f"plain_out_{src.stem}.png"
+        r = subprocess.run([args.cli, "--models", args.models, "--precision", args.precision, "--plain", str(png), str(out)],
+                           capture_output=True, text=True)  # fmt: skip
+        total += 1
+        if r.returncode != 0:
+            failed += 1
+            print(f"FAIL plain {src.stem}: smq_cli exit {r.returncode}: {r.stderr.strip()[:200]}")
+            continue
+        b = np.asarray(Image.open(out))[..., 3].astype(np.float64)
+        mean = np.abs(a - b).mean()
+        ok = mean <= args.max_mean
+        failed += not ok
+        print(f"{'PASS' if ok else 'FAIL'} plain {src.stem[:16]:16s} mean|diff| {mean:.4f}/255  max {np.abs(a - b).max():.0f}")
     print(f"{total - failed}/{total} passed")
     return 1 if failed else 0
 

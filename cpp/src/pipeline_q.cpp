@@ -21,6 +21,12 @@ constexpr float kCoreProb = 0.5f;
 constexpr float kExtendProb = 0.3f;
 constexpr double kCoreMinRatio = 0.05;
 constexpr double kSafetyPad = 0.15;  // pipeline A's SAFETY_PAD
+// matting/plain_background.py
+constexpr double kRingFrac = 0.01;
+constexpr double kUniformTol = 16;
+constexpr double kUniformShare = 0.95;
+constexpr double kKeyTol = 24;
+constexpr double kMinArea = 0.0005;
 
 double now() {
     using namespace std::chrono;
@@ -117,6 +123,59 @@ Mask complete_instance(const std::vector<float> &prob, int w, int h, const std::
         for (size_t k = 0; k < c.data.size(); k++) core.data[k] |= c.data[k];
     auto safety = pad_box(box, round_half_even(kSafetyPad * std::max(w, h)), w, h);
     return fuse_masks(extend, core, safety);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Plain background (matting/plain_background.py)
+
+bool plain_background(const ImageU8 &work, std::array<double, 3> &bg) {
+    const int w = work.w, h = work.h;
+    const int m = int(std::max(2L, round_half_even(kRingFrac * std::max(w, h))));
+    std::vector<const uint8_t *> ring;
+    auto add = [&](int x, int y) { ring.push_back(work.data.data() + (size_t(y) * w + x) * 3); };
+    for (int y = 0; y < h; y++) {
+        bool edge_row = y < m || y >= h - m;
+        for (int x = 0; x < w; x++)
+            if (edge_row || x < m || x >= w - m) add(x, y);
+    }
+    if (ring.empty()) return false;
+    // numpy.median per channel: the middle value, or the mean of the two middle values for an even count.
+    for (int c = 0; c < 3; c++) {
+        size_t hist[256] = {0};
+        for (const uint8_t *p : ring) hist[p[c]]++;
+        auto kth = [&](size_t k) {
+            size_t acc = 0;
+            for (int v = 0; v < 256; v++) {
+                acc += hist[v];
+                if (acc > k) return double(v);
+            }
+            return 255.0;
+        };
+        size_t n = ring.size();
+        bg[c] = n % 2 ? kth(n / 2) : (kth(n / 2 - 1) + kth(n / 2)) / 2.0;
+    }
+    size_t uniform = 0;
+    for (const uint8_t *p : ring) {
+        double d = std::max({std::fabs(p[0] - bg[0]), std::fabs(p[1] - bg[1]), std::fabs(p[2] - bg[2])});
+        uniform += d <= kUniformTol;
+    }
+    return double(uniform) / double(ring.size()) >= kUniformShare;
+}
+
+Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg) {
+    Mask fg(work.w, work.h);
+    for (size_t i = 0; i < fg.data.size(); i++) {
+        const uint8_t *p = work.data.data() + i * 3;
+        double d = std::max({std::fabs(p[0] - bg[0]), std::fabs(p[1] - bg[1]), std::fabs(p[2] - bg[2])});
+        fg.data[i] = d > kKeyTol;
+    }
+    std::vector<int32_t> labels;
+    std::vector<int64_t> areas;
+    int n = connected_components(fg, labels, &areas);
+    std::vector<uint8_t> keep(n, 0);
+    for (int l = 1; l < n; l++) keep[l] = double(areas[l]) >= kMinArea * double(fg.data.size());
+    for (size_t i = 0; i < fg.data.size(); i++) fg.data[i] = keep[labels[i]];
+    return fg;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -300,25 +359,48 @@ ImageU8 PipelineQ::run(const ImageU8 &rgb, const std::vector<Subject> &subjects,
         }
         double t1 = now();
         if (!mask.any()) throw NothingSegmented("SAM3 did not segment anything at the given boxes");
-
-        std::vector<uint8_t> trimap = make_trimap(mask);
-        std::vector<float> alpha = impl_->matte(work, trimap);
-        std::vector<float> full(size_t(rgb.w) * rgb.h);
-        resize_linear(alpha.data(), w, h, full.data(), rgb.w, rgb.h);
-        ImageU8 out(rgb.w, rgb.h, 4);
-        for (size_t i = 0; i < full.size(); i++) {
-            float a = std::min(std::max(full[i], 0.f), 1.f);
-            out.data[i * 4] = rgb.data[i * 3];
-            out.data[i * 4 + 1] = rgb.data[i * 3 + 1];
-            out.data[i * 4 + 2] = rgb.data[i * 3 + 2];
-            out.data[i * 4 + 3] = uint8_t(a * 255.f);
-        }
+        ImageU8 out = matte_and_compose(rgb, work, mask);
         double t2 = now();
         if (timings) *timings = {t1 - t0, t2 - t1, t2 - t0};
         return out;
     } catch (const Ort::Exception &e) {
         throw std::runtime_error(std::string("onnxruntime: ") + e.what());
     }
+}
+
+ImageU8 PipelineQ::run_plain(const ImageU8 &rgb, TimingsQ *timings) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
+    try {
+        double t0 = now();
+        ImageU8 work = resize_long_side(rgb);
+        std::array<double, 3> bg{};
+        if (!plain_background(work, bg)) throw NotPlain("the background is not a plain colour");
+        Mask mask = key_mask(work, bg);
+        if (!mask.any()) throw NotPlain("nothing differs from the background colour");
+        double t1 = now();
+        ImageU8 out = matte_and_compose(rgb, work, mask);
+        double t2 = now();
+        if (timings) *timings = {t1 - t0, t2 - t1, t2 - t0};
+        return out;
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
+
+ImageU8 PipelineQ::matte_and_compose(const ImageU8 &rgb, const ImageU8 &work, const Mask &mask) {
+    std::vector<uint8_t> trimap = make_trimap(mask);
+    std::vector<float> alpha = impl_->matte(work, trimap);
+    std::vector<float> full(size_t(rgb.w) * rgb.h);
+    resize_linear(alpha.data(), work.w, work.h, full.data(), rgb.w, rgb.h);
+    ImageU8 out(rgb.w, rgb.h, 4);
+    for (size_t i = 0; i < full.size(); i++) {
+        float a = std::min(std::max(full[i], 0.f), 1.f);
+        out.data[i * 4] = rgb.data[i * 3];
+        out.data[i * 4 + 1] = rgb.data[i * 3 + 1];
+        out.data[i * 4 + 2] = rgb.data[i * 3 + 2];
+        out.data[i * 4 + 3] = uint8_t(a * 255.f);
+    }
+    return out;
 }
 
 }  // namespace sm

@@ -122,12 +122,13 @@ def main() -> None:
             try:
                 rgba, info = pq.run(img, instruction)
                 thumb(checkerboard_preview(rgba)).save(out / "img" / f"{tag}_Q.jpg")
-                thumb(boxes_preview(img, info["detection"])).save(out / "img" / f"{tag}_boxes.jpg")
+                if info["detection"] is not None:  # None: plain-background fast path, no Qwen call
+                    thumb(boxes_preview(img, info["detection"])).save(out / "img" / f"{tag}_boxes.jpg")
                 row.update(
                     ok=True, stages=info["stages"], total=info["total"],
                     subjects=[{"label": c.subject.label, "box": [round(v) for v in c.subject.box], "kept": c.kept,
                                "scores": [round(s, 3) for s in c.scores]} for c in info["choices"]],
-                    usage=info["detection"].usage,
+                    usage=info["detection"].usage if info["detection"] is not None else {},
                 )  # fmt: skip
             except NoSubjectError as e:
                 row.update(ok=False, error=str(e))

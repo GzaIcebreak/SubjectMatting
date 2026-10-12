@@ -35,8 +35,18 @@ std::vector<int> select_instances(const Instances &inst, const std::array<double
 std::vector<int> drop_duplicates(const Instances &inst, const std::vector<int> &idx, double share = 0.5);
 Mask complete_instance(const std::vector<float> &prob, int w, int h, const std::array<double, 4> &box);
 
+// Plain-background fast path (matting/plain_background.py): the background colour if the border ring is uniform.
+bool plain_background(const ImageU8 &work, std::array<double, 3> &bg);
+// Pixels that differ from the background colour, specks removed.
+Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg);
+
 struct TimingsQ {
     double sam3 = 0, matting = 0, total = 0;  // seconds
+};
+
+// The background is not a plain colour (run_plain); use run() with subjects instead.
+struct NotPlain : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 // No instance of any subject could be segmented.
@@ -56,7 +66,13 @@ public:
     // rgb: 3-channel image; subjects in its pixel coordinates -> RGBA. Throws NothingSegmented or runtime_error.
     ImageU8 run(const ImageU8 &rgb, const std::vector<Subject> &subjects, TimingsQ *timings = nullptr);
 
+    // Auto mode on a solid background: everything that isn't background, no SAM3. Throws NotPlain otherwise.
+    // timings->sam3 holds the keying time.
+    ImageU8 run_plain(const ImageU8 &rgb, TimingsQ *timings = nullptr);
+
 private:
+    ImageU8 matte_and_compose(const ImageU8 &rgb, const ImageU8 &work, const Mask &mask);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

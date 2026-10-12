@@ -1,0 +1,38 @@
+"""Plain-background fast path for pipeline Q's auto mode.
+
+Product shots and renders often sit on a solid background. There the subject is simply everything that differs from
+the background colour - including parts a segmentation model might not count as "the object" (a model's base, a
+pedestal) - and no vision-language model or SAM3 run is needed. Ported to C++ in cpp/src/pipeline_q.cpp.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+from .common import largest_components
+
+RING_FRAC = 0.01  # border ring width, x the long side (at least 2 px)
+UNIFORM_TOL = 16  # a ring pixel matches the background if every channel is within this
+UNIFORM_SHARE = 0.95  # share of ring pixels that must match for the background to count as plain
+KEY_TOL = 24  # foreground: some channel differs from the background by more than this
+MIN_AREA = 0.0005  # foreground pieces smaller than this x the image are noise
+
+
+def plain_background(work: Image.Image) -> np.ndarray | None:
+    """Background colour (per-channel median of the border ring) if the border is uniform, else None."""
+    a = np.asarray(work.convert("RGB"), np.int16)
+    h, w, _ = a.shape
+    m = max(2, round(RING_FRAC * max(w, h)))
+    ring = np.concatenate([a[:m].reshape(-1, 3), a[-m:].reshape(-1, 3), a[m:-m, :m].reshape(-1, 3), a[m:-m, -m:].reshape(-1, 3)])
+    bg = np.median(ring, axis=0)
+    share = (np.abs(ring - bg).max(axis=1) <= UNIFORM_TOL).mean()
+    return bg if share >= UNIFORM_SHARE else None
+
+
+def key_mask(work: Image.Image, bg: np.ndarray) -> np.ndarray:
+    """Pixels that differ from the background colour, without specks."""
+    a = np.asarray(work.convert("RGB"), np.int16)
+    fg = np.abs(a - bg).max(axis=2) > KEY_TOL
+    keep = [c for c in largest_components(fg, min_ratio=0.0) if c.sum() >= MIN_AREA * fg.size]
+    return np.logical_or.reduce(keep) if keep else np.zeros(fg.shape, bool)

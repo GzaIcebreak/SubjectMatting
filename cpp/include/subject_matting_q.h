@@ -49,6 +49,7 @@ typedef struct smq_timings {
 #define SMQ_INVALID_ARGUMENTS 1
 #define SMQ_ERROR 2
 #define SMQ_NOTHING_SEGMENTED 3 /* SAM3 found nothing at the given boxes */
+#define SMQ_NOT_PLAIN 4         /* smq_matte_plain: the background is not a solid colour */
 
 SMQ_API const char *smq_version(void);
 
@@ -58,6 +59,14 @@ SMQ_API smq_context *smq_create(const char *models_dir, const char *precision, i
 /* rgb: width*height 8-bit RGB, rows `stride` bytes apart, EXIF orientation applied. out_rgba: width*height*4. */
 SMQ_API int smq_matte(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, const smq_subject *subjects,
                       int num_subjects, uint8_t *out_rgba, smq_timings *timings, char *err, size_t err_len);
+
+/*
+ * Auto mode for solid backgrounds (product shots, renders): if the image border is one uniform colour, the subject is
+ * everything that differs from it - no subjects needed, no SAM3 run. Returns SMQ_NOT_PLAIN otherwise; then ask the
+ * vision-language model and call smq_matte. timings->sam3 holds the keying time.
+ */
+SMQ_API int smq_matte_plain(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, uint8_t *out_rgba,
+                            smq_timings *timings, char *err, size_t err_len);
 
 SMQ_API void smq_destroy(smq_context *ctx);
 
