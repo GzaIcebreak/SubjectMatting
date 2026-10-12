@@ -12,3 +12,6 @@ test_images/
 onnx_models/
 cpp/build/
 cpp/third_party/onnxruntime/
+.env
+third_party/
+onnx_models_sam3/

@@ -1,0 +1,7 @@
+# Extra packages for the Qwen-VL + EfficientSAM3 pipeline (matting/pipeline_vlm.py), on top of requirements.txt.
+# The upstream EfficientSAM3 code imports these at module load even for image-only inference.
+ftfy==6.1.1
+iopath==0.1.10
+pycocotools==2.0.11
+psutil==7.2.2
+omegaconf==2.4.0
