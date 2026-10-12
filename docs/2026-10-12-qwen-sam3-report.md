@@ -68,3 +68,28 @@ PYTHONPATH=. .venv/bin/python scripts/probe_sam3_onnx.py
 ```
 
 需要 `DASHSCOPE_API_KEY`（环境变量或仓库根目录 `.env`）。
+
+## 第二、三阶段：C++ 核心与 SubjectMatting Q.app（2026-10-12）
+
+独立的新 app（名字 SubjectMatting Q，Bundle ID `com.gzaicebreak.subjectmatting.q`），可以和 SAM2 版同时安装。
+SAM2 版的界面、worker、C++ 流水线和 Python 代码都没改；共用的 `MattingCore` 只做了向后兼容的扩展
+（任务可带"指令"、worker 可指定可执行文件名和额外环境变量），SAM2 版行为和测试不变。
+
+**ONNX 导出**（`scripts/export_sam3_onnx.py`）：图像编码器、文本编码器、解码器三个模型。解码器导出的关键是把上游
+`concat_padded_sequences`（数据相关的索引）在导出时换成普通拼接——我们的提示没有填充，结果完全一致；
+解码器一次只接受一个示例框，所以流水线改成"每个主体解码一次"（PyTorch 版同步改了）。
+fp16 与 PyTorch 在 25 个评测用例上 IoU ≥ 0.9993。
+
+**C++ 核心**（`libsubject_matting_q`，头文件 `subject_matting_q.h`，与 SAM2 的库分开）：调用方传入 Qwen 给的
+主体（英文词 + 框），库内分割、挑个体、清理、trimap、ViTMatte，不联网。CLIP 分词器移植到 C++，34 个标签与 Python
+完全一致；整条流水线与 Python ONNX 参考版在 24 个用例上逐像素一致（`cpp/tests/parity_q.py`）。
+
+**app**（`scripts/build_macos_app_q.sh` → `dist/SubjectMatting Q.app`，269MB：模型 236MB、库 32MB）：
+- 右侧顶部"要抠什么？"输入框：留空 = 自动识别主体；输入后新加的图都按这个要求抠；回车或「重新抠图」用新要求重做选中的图，
+  右键菜单也有。列表里每张图下面显示它用的要求。
+- 「设置」（⌘,）里填阿里云百炼 API Key，存进钥匙串，保存后后台进程自动重启生效；没填 Key 时界面提示并给出设置入口。
+- 后台进程 `matting-worker-q`：每张图先调 Qwen（缩到长边 1024 的 JPEG），再调 C++ 核心；网络在后台进程里，界面不卡。
+- 本机实测：单主体每张 5.4~7.4 秒（Qwen 1.3~2.9 秒 + SAM3 约 4.5 秒 + 边缘 0.5~1 秒），两个主体的图约 15 秒。
+
+**已知问题**：SAM3 解码器在 ONNX Runtime 上比 PyTorch 慢约 2.5 倍（对 72×72 个图像 token 的注意力，PyTorch 有优化算子），
+每多一个主体多约 4 秒；CoreML 执行器因个别张量形状不支持而无法使用。

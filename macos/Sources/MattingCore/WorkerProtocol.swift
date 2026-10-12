@@ -79,6 +79,8 @@ public enum WorkerEvent: Equatable, Sendable {
 public enum WorkerCommand: Equatable, Sendable {
     case plan(id: Int, inputs: [String], outputDir: String?)
     case run(id: Int, src: String, dst: String)
+    /// `run` with what to cut out, for workers that ask a vision-language model (SubjectMatting Q).
+    case runInstructed(id: Int, src: String, dst: String, instruction: String)
 
     /// One JSON object terminated by a newline, ready to write to the worker's stdin.
     public func encodedLine() -> Data {
@@ -88,6 +90,8 @@ public enum WorkerCommand: Equatable, Sendable {
             obj = ["id": id, "cmd": "plan", "inputs": inputs, "output_dir": outputDir ?? NSNull()]
         case let .run(id, src, dst):
             obj = ["id": id, "cmd": "run", "src": src, "dst": dst]
+        case let .runInstructed(id, src, dst, instruction):
+            obj = ["id": id, "cmd": "run", "src": src, "dst": dst, "instruction": instruction]
         }
         var data = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
         data.append(0x0A)

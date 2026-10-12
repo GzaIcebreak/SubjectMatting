@@ -17,32 +17,42 @@ public final class WorkerProcess: WorkerTransport {
     public var onExit: ((Int32) -> Void)?
 
     private let process = Process()
+    private let extraEnvironment: [String: String]
+    private let executableName: String
     private let stdin = Pipe()
     private let stdout = Pipe()
     private var buffer = Data()
 
-    public init() {}
+    /// extraEnvironment is added to the worker's inherited environment (e.g. an API key for SubjectMatting Q).
+    /// executableName: the worker inside Contents/MacOS ("matting-worker-q" for SubjectMatting Q).
+    public init(extraEnvironment: [String: String] = [:], executableName: String = "matting-worker") {
+        self.extraEnvironment = extraEnvironment
+        self.executableName = executableName
+    }
 
     /// $SUBJECTMATTING_WORKER is a command line run from the current directory, e.g.
     /// "macos/.build/debug/matting-worker --lib cpp/build/libsubject_matting.dylib --models onnx_models"
     /// or the Python reference ".venv/bin/python worker.py".
-    static func command() -> (URL, [String]) {
+    static func command(executableName: String = "matting-worker") -> (URL, [String]) {
         if let dev = ProcessInfo.processInfo.environment["SUBJECTMATTING_WORKER"], !dev.isEmpty {
             let parts = dev.split(separator: " ").map(String.init)
             let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             return (URL(fileURLWithPath: parts[0], relativeTo: cwd).absoluteURL, Array(parts.dropFirst()))
         }
-        let exe = Bundle.main.url(forAuxiliaryExecutable: "matting-worker")
-            ?? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/matting-worker")
+        let exe = Bundle.main.url(forAuxiliaryExecutable: executableName)
+            ?? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/\(executableName)")
         return (exe, [])
     }
 
     public func start() throws {
         // Writing to a worker that just died must fail with EPIPE, not kill the app with SIGPIPE.
         signal(SIGPIPE, SIG_IGN)
-        let (exe, args) = Self.command()
+        let (exe, args) = Self.command(executableName: executableName)
         process.executableURL = exe
         process.arguments = args
+        if !extraEnvironment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(extraEnvironment) { _, new in new }
+        }
         process.standardInput = stdin
         process.standardOutput = stdout
         // stderr is not read: the worker sends its own output to the log file. Inherit it for development.

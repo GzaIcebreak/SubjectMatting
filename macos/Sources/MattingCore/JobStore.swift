@@ -15,6 +15,8 @@ public struct Job: Identifiable, Equatable, Sendable {
     public let src: URL
     public var dst: URL
     public var status: JobStatus
+    /// What to cut out, for SubjectMatting Q ("只要左边那只猫"); nil = the worker decides.
+    public var instruction: String? = nil
 
     var isWaiting: Bool { status == .queued || status == .stopped }
 }
@@ -41,7 +43,10 @@ public final class JobStore {
 
     public static let maxConsecutiveCrashes = 3
 
-    private enum PlanPurpose { case add, replan }
+    private enum PlanPurpose {
+        case add(instruction: String?)
+        case replan
+    }
 
     private let makeTransport: () -> WorkerTransport
     private var transport: WorkerTransport?
@@ -94,8 +99,39 @@ public final class JobStore {
     // MARK: User actions
 
     public func add(_ urls: [URL]) {
+        add(urls, instruction: nil)
+    }
+
+    /// `instruction` is sent with each of these images' `run` (SubjectMatting Q); nil or blank = automatic.
+    public func add(_ urls: [URL], instruction: String?) {
         guard !urls.isEmpty else { return }
-        sendPlan(.add, inputs: urls.map(\.path))
+        sendPlan(.add(instruction: Self.normalized(instruction)), inputs: urls.map(\.path))
+    }
+
+    /// Processes these jobs again (finished ones too) with a new instruction.
+    public func requeue(_ ids: [Job.ID], instruction: String?) {
+        for i in jobs.indices where ids.contains(jobs[i].id) && jobs[i].status != .processing {
+            jobs[i].instruction = Self.normalized(instruction)
+            jobs[i].status = .queued
+        }
+        pump()
+    }
+
+    /// Stops the worker and starts a fresh one (e.g. after the API key changed).
+    public func restartWorker() {
+        shutdown()
+        pendingPlans.removeAll()
+        if let r = running, let i = jobs.firstIndex(where: { $0.id == r.jobID }) {
+            jobs[i].status = .queued
+        }
+        running = nil
+        consecutiveCrashes = 0
+        start()
+    }
+
+    static func normalized(_ instruction: String?) -> String? {
+        let t = instruction?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return t.isEmpty ? nil : t
     }
 
     /// Applies to jobs that have not been processed yet; finished results stay where they are.
@@ -190,7 +226,7 @@ public final class JobStore {
                 return
             }
             switch purpose {
-            case .add: addPlanned(planned)
+            case let .add(instruction): addPlanned(planned, instruction: instruction)
             case .replan: applyReplan(planned)
             }
             if !skipped.isEmpty {
@@ -206,7 +242,7 @@ public final class JobStore {
         }
     }
 
-    private func addPlanned(_ planned: [PlannedJob]) {
+    private func addPlanned(_ planned: [PlannedJob], instruction: String?) {
         var firstNew: UUID?
         for p in planned {
             let src = URL(fileURLWithPath: p.src).standardizedFileURL
@@ -216,10 +252,11 @@ public final class JobStore {
                 if jobs[i].status == .queued || jobs[i].status == .processing { continue }
                 jobs[i].dst = uniqueDestination(dst, excluding: jobs[i].id)
                 jobs[i].status = .queued
+                jobs[i].instruction = instruction
                 firstNew = firstNew ?? jobs[i].id
             } else {
                 let id = UUID()
-                jobs.append(Job(id: id, src: src, dst: uniqueDestination(dst, excluding: id), status: .queued))
+                jobs.append(Job(id: id, src: src, dst: uniqueDestination(dst, excluding: id), status: .queued, instruction: instruction))
                 firstNew = firstNew ?? id
             }
         }
@@ -257,7 +294,11 @@ public final class JobStore {
         jobs[i].status = .processing
         let id = nextCommandID()
         running = (id, jobs[i].id)
-        transport.send(.run(id: id, src: jobs[i].src.path, dst: jobs[i].dst.path))
+        if let instruction = jobs[i].instruction {
+            transport.send(.runInstructed(id: id, src: jobs[i].src.path, dst: jobs[i].dst.path, instruction: instruction))
+        } else {
+            transport.send(.run(id: id, src: jobs[i].src.path, dst: jobs[i].dst.path))
+        }
     }
 
     private func finish(_ commandID: Int, _ status: JobStatus) {

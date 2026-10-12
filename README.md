@@ -48,6 +48,21 @@ SUBJECTMATTING_WORKER="macos/.build/debug/matting-worker --lib cpp/build/libsubj
 本库 0.14 MB + ONNX Runtime 33 MB + fp16 模型 208 MB，结果与 Python 版逐像素一致。
 模型用 `scripts/export_onnx.py` 导出，Python 参考实现是 `matting/pipeline_onnx.py`（额外依赖见 `requirements-onnx.txt`）。
 
+## SubjectMatting Q（分支 `feat/qwen-sam3`）
+
+另一个独立 app：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），EfficientSAM3 分割，ViTMatte 处理边缘。
+设计、评测和实现记录见 [docs/2026-10-12-qwen-sam3-report.md](docs/2026-10-12-qwen-sam3-report.md)。
+
+```bash
+PYTHONPATH=.:third_party/efficientsam3/sam3 .venv/bin/python scripts/export_sam3_onnx.py
+```
+```bash
+scripts/build_macos_app_q.sh
+```
+
+需要先 `scripts/fetch_efficientsam3.sh` 和 `uv pip install -p .venv -r requirements-vlm.txt -r requirements-onnx.txt`；
+API Key 在 app 的「设置」里填写（开发时也可以用环境变量 `DASHSCOPE_API_KEY`）。
+
 ## 环境
 
 已建好：`.venv`（Python 3.12，torch CPU 版）。重建方法：

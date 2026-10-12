@@ -18,7 +18,10 @@ final class FakeTransport: WorkerTransport {
     func exit(_ status: Int32) { onExit?(status) }
 
     var lastRun: (id: Int, src: String, dst: String)? {
-        for c in sent.reversed() { if case let .run(id, src, dst) = c { return (id, src, dst) } }
+        for c in sent.reversed() {
+            if case let .run(id, src, dst) = c { return (id, src, dst) }
+            if case let .runInstructed(id, src, dst, _) = c { return (id, src, dst) }
+        }
         return nil
     }
 
@@ -280,5 +283,34 @@ final class JobPlannerTests: XCTestCase {
         XCTAssertEqual(jobs, [])
         XCTAssertEqual(skipped.map { URL(fileURLWithPath: $0.path).lastPathComponent }, ["notes.txt", "nope.jpg", "empty", "a.png"])
         XCTAssertEqual(skipped.map(\.reason), ["不支持的格式", "文件不存在", "文件夹里没有图片", "输出文件夹不能和输入文件夹相同"])
+    }
+}
+
+/// SubjectMatting Q: jobs carry an optional instruction that goes out with their `run`.
+final class InstructionTests: XCTestCase {
+    func testInstructionTravelsWithRunAndRequeueChangesIt() {
+        var transports: [FakeTransport] = []
+        let store = JobStore {
+            let t = FakeTransport()
+            transports.append(t)
+            return t
+        }
+        store.start()
+        let t = transports[0]
+        store.add([URL(fileURLWithPath: "/in/a.jpg")], instruction: "  只要猫 ")
+        t.emit(.plan(id: t.lastPlanID!, jobs: [PlannedJob(src: "/in/a.jpg", dst: "/out/a.png")], skipped: [], error: nil))
+        t.emit(.ready)
+        XCTAssertEqual(t.sent.last, .runInstructed(id: t.lastRun!.id, src: "/in/a.jpg", dst: "/out/a.png", instruction: "只要猫"))
+        t.emit(.result(id: t.lastRun!.id, dst: "/out/a.png", total: 1, stages: [:]))
+        store.requeue([store.jobs[0].id], instruction: "")
+        XCTAssertNil(store.jobs[0].instruction)
+        if case .run = t.sent.last! {} else { XCTFail("blank instruction should send a plain run") }
+    }
+
+    func testRunInstructedEncodesTheInstruction() throws {
+        let line = WorkerCommand.runInstructed(id: 3, src: "/a.jpg", dst: "/a.png", instruction: "左边的猫").encodedLine()
+        let obj = try JSONSerialization.jsonObject(with: line.dropLast()) as! [String: Any]
+        XCTAssertEqual(obj["cmd"] as? String, "run")
+        XCTAssertEqual(obj["instruction"] as? String, "左边的猫")
     }
 }
