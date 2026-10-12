@@ -64,6 +64,13 @@ final class RunQueue {
         cond.unlock()
     }
 
+    /// The next item without removing it (nil when the queue is empty or closed).
+    func peek() -> [String: Any]? {
+        cond.lock()
+        defer { cond.unlock() }
+        return items.first ?? nil
+    }
+
     func take() -> [String: Any]? {
         cond.lock()
         while items.isEmpty { cond.wait() }
@@ -74,6 +81,15 @@ final class RunQueue {
 }
 
 let runs = RunQueue()
+
+/// One line per image in the log: what was done and how long each step took.
+func log(_ name: String, _ img: ImageFiles.RGB, _ what: String, _ stages: [String: Double]) {
+    let order = ["load", "key", "prepare", "qwen", "sam3", "matting", "write"]
+    let parts = order.compactMap { k in stages[k].map { "\(k) \(String(format: "%.2f", $0))" } }
+    let total = stages.values.reduce(0, +)
+    let line = "\(name) \(img.width)x\(img.height): \(what) | \(parts.joined(separator: " ")) | total \(String(format: "%.2f", total))s\n"
+    FileHandle.standardError.write(line.data(using: .utf8)!)
+}
 
 Thread {
     while let line = readLine(strippingNewline: true) {
@@ -116,6 +132,90 @@ do {
 }
 send(["type": "ready"])
 
+/// Work done ahead for a queued image while the current one is being matted: load it and, unless it has a plain
+/// background (no Qwen needed), ask Qwen. Network time then overlaps with local compute.
+final class Prefetch {
+    final class Item {
+        let loaded = DispatchSemaphore(value: 0)  // image loaded and plain-background decided
+        let done = DispatchSemaphore(value: 0)  // Qwen answered (or not needed)
+        var img: Result<ImageFiles.RGB, Error> = .failure(ImageFiles.Failure(description: "图片没有读取"))
+        var loadSeconds = 0.0
+        var plain = false
+        var subjects: Result<[QwenSubject], Error> = .success([])
+        var qwenSeconds = 0.0
+        private let lock = NSLock()
+        private var finished = false
+
+        var isFinished: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return finished
+        }
+
+        func finish() {
+            lock.lock()
+            finished = true
+            lock.unlock()
+            done.signal()
+        }
+    }
+
+    private var items: [String: Item] = [:]
+    private let lock = NSLock()
+
+    static func key(_ msg: [String: Any]) -> String { "\(msg["id"] ?? "")|\(msg["src"] ?? "")" }
+
+    func start(_ msg: [String: Any]) {
+        let key = Self.key(msg)
+        lock.lock()
+        if items[key] != nil {
+            lock.unlock()
+            return
+        }
+        let item = Item()
+        items[key] = item
+        lock.unlock()
+        let instruction = (msg["instruction"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var signaledLoaded = false
+            defer {
+                if !signaledLoaded { item.loaded.signal() }
+                item.finish()
+            }
+            guard let src = msg["src"] as? String else { return }
+            let t0 = Date()
+            do {
+                let img = try ImageFiles.loadRGB(URL(fileURLWithPath: src))
+                item.img = .success(img)
+                item.loadSeconds = Date().timeIntervalSince(t0)
+                item.plain = instruction == nil && engine.isPlain(rgb: img.pixels, width: img.width, height: img.height)
+                item.loaded.signal()
+                signaledLoaded = true
+                if item.plain { return }
+                let t1 = Date()
+                item.subjects = Result {
+                    try qwen.detect(jpeg: try ImageFiles.jpegForUpload(img), width: img.width, height: img.height, instruction: instruction)
+                }
+                item.qwenSeconds = Date().timeIntervalSince(t1)
+            } catch {
+                item.img = .failure(error)
+            }
+        }
+    }
+
+    /// The work for msg, started now if it wasn't prefetched; returns once the image is loaded.
+    func take(_ msg: [String: Any]) -> Item {
+        start(msg)
+        lock.lock()
+        let item = items.removeValue(forKey: Self.key(msg))!
+        lock.unlock()
+        item.loaded.wait()
+        return item
+    }
+}
+
+let prefetch = Prefetch()
+
 while let msg = runs.take() {
     let id = msg["id"] ?? NSNull()
     let instruction = (msg["instruction"] as? String).flatMap { $0.isEmpty ? nil : $0 }
@@ -123,28 +223,48 @@ while let msg = runs.take() {
         guard let src = msg["src"] as? String, let dst = msg["dst"] as? String else {
             throw ImageFiles.Failure(description: "run 命令缺少 src/dst")
         }
-        let img = try ImageFiles.loadRGB(URL(fileURLWithPath: src))
+        let name = URL(fileURLWithPath: src).lastPathComponent
+        // Start on the next queued image (load + Qwen) while this one is matted.
+        if let next = runs.peek() { prefetch.start(next) }
+        // This image: prefetched if it was queued behind the previous one; otherwise start it now, so Qwen's
+        // round trip overlaps with the SAM3 image encoding below.
+        let item = prefetch.take(msg)
+        let img = try item.img.get()
+        let loadSeconds = item.loadSeconds
         let dstURL = URL(fileURLWithPath: dst)
         try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         // Auto mode on a solid background: everything that isn't background is the subject. No Qwen, no SAM3.
-        if instruction == nil, let (rgba, t) = try engine.mattePlain(rgb: img.pixels, width: img.width, height: img.height) {
-            FileHandle.standardError.write("\(URL(fileURLWithPath: src).lastPathComponent): plain background\n".data(using: .utf8)!)
+        if item.plain, let (rgba, t) = try engine.mattePlain(rgb: img.pixels, width: img.width, height: img.height) {
+            let tWrite = Date()
             try ImageFiles.writePNG(rgba: rgba, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dstURL)
+            log(name, img, "plain background", ["load": loadSeconds, "key": t.sam3, "matting": t.matting, "write": Date().timeIntervalSince(tWrite)])
             send(["type": "result", "id": id, "dst": dst, "total": t.total, "stages": ["key": t.sam3, "matting": t.matting]])
             continue
         }
-        let t0 = Date()
-        let subjects = try qwen.detect(jpeg: try ImageFiles.jpegForUpload(img), width: img.width, height: img.height, instruction: instruction)
-        let qwenSeconds = Date().timeIntervalSince(t0)
-        FileHandle.standardError.write("\(URL(fileURLWithPath: src).lastPathComponent): \(subjects.map(\.label)) in \(String(format: "%.1f", qwenSeconds))s\n".data(using: .utf8)!)
+        // While Qwen answers (unless it already has), encode the image for SAM3.
+        let tPrepare = Date()
+        if !item.isFinished { try engine.prepare(rgb: img.pixels, width: img.width, height: img.height) }
+        let prepareSeconds = Date().timeIntervalSince(tPrepare)
+        let tWait = Date()
+        item.done.wait()
+        let qwenWaitSeconds = Date().timeIntervalSince(tWait)
+        let subjects = try item.subjects.get()
         if subjects.isEmpty {
             throw ImageFiles.Failure(description: instruction.map { "图中没找到：\($0)" } ?? "没有识别到主体")
         }
         let (rgba, t) = try engine.matte(rgb: img.pixels, width: img.width, height: img.height, subjects: subjects)
+        let plainSeconds = 0.0
+        let qwenSeconds = item.qwenSeconds
+        let tWrite = Date()
         try ImageFiles.writePNG(rgba: rgba, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dstURL)
+        log(name, img, "\(instruction.map { "「\($0)」" } ?? "auto") \(subjects.map(\.label)) (Qwen \(String(format: "%.2f", qwenSeconds))s, waited \(String(format: "%.2f", qwenWaitSeconds))s)", [
+            "load": loadSeconds, "prepare": prepareSeconds, "qwen": qwenWaitSeconds, "sam3": t.sam3, "matting": t.matting,
+            "write": Date().timeIntervalSince(tWrite),
+        ])
+        _ = plainSeconds
         send([
-            "type": "result", "id": id, "dst": dst, "total": qwenSeconds + t.total,
-            "stages": ["qwen": qwenSeconds, "sam3": t.sam3, "matting": t.matting],
+            "type": "result", "id": id, "dst": dst, "total": qwenWaitSeconds + prepareSeconds + t.total,
+            "stages": ["qwen": qwenWaitSeconds, "sam3": prepareSeconds + t.sam3, "matting": t.matting],
         ])
     } catch let MattingEngineQ.Failure.nothingSegmented(message) {
         send(["type": "error", "id": id, "message": "没有在 Qwen 给出的位置分割出对象（\(message)）"])

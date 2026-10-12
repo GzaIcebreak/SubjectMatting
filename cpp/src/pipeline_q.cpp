@@ -27,6 +27,7 @@ constexpr double kUniformTol = 16;
 constexpr double kUniformShare = 0.95;
 constexpr double kKeyTol = 24;
 constexpr double kMinArea = 0.0005;
+constexpr int kMatteMargin = 64;  // matting/pipeline_vlm.py MATTE_MARGIN
 
 double now() {
     using namespace std::chrono;
@@ -178,6 +179,24 @@ Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg) {
     return fg;
 }
 
+bool is_plain(const ImageU8 &rgb) {
+    ImageU8 work = resize_long_side(rgb);
+    std::array<double, 3> bg{};
+    return plain_background(work, bg) && key_mask(work, bg).any();
+}
+
+namespace {
+
+// Cheap identity check for prepare(): size plus a sample of the pixels.
+uint64_t fingerprint(const ImageU8 &img) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t(img.w) << 32 | uint64_t(img.h));
+    const size_t step = std::max<size_t>(1, img.data.size() / 4096);
+    for (size_t i = 0; i < img.data.size(); i += step) h = (h ^ img.data[i]) * 1099511628211ull;
+    return h;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------------------------------------------
 // Models
 
@@ -201,6 +220,12 @@ struct PipelineQ::Impl {
     struct Feats {
         std::vector<float> fpn0, fpn1, fpn2, pos2;
     };
+
+    // prepare() result, used once by the next run() on the same pixels.
+    bool prepared = false;
+    uint64_t prepared_id = 0;
+    ImageU8 prepared_work;
+    Feats prepared_feats;
 
     Feats encode_image(const ImageU8 &work) {
         ImageU8 r = pil_resize(work, kSam3Size, kSam3Size, Filter::Bilinear);
@@ -344,10 +369,18 @@ ImageU8 PipelineQ::run(const ImageU8 &rgb, const std::vector<Subject> &subjects,
     if (subjects.empty()) throw NothingSegmented("no subjects given");
     try {
         double t0 = now();
-        ImageU8 work = resize_long_side(rgb);
+        ImageU8 work;
+        Impl::Feats feats;
+        if (impl_->prepared && impl_->prepared_id == fingerprint(rgb)) {
+            work = std::move(impl_->prepared_work);
+            feats = std::move(impl_->prepared_feats);
+        } else {
+            work = resize_long_side(rgb);
+            feats = impl_->encode_image(work);
+        }
+        impl_->prepared = false;
         const int w = work.w, h = work.h;
         const double sx = double(w) / rgb.w, sy = double(h) / rgb.h;
-        Impl::Feats feats = impl_->encode_image(work);
         Mask mask(w, h);
         for (const Subject &s : subjects) {
             std::array<double, 4> box{s.box[0] * sx, s.box[1] * sy, s.box[2] * sx, s.box[3] * sy};
@@ -363,6 +396,19 @@ ImageU8 PipelineQ::run(const ImageU8 &rgb, const std::vector<Subject> &subjects,
         double t2 = now();
         if (timings) *timings = {t1 - t0, t2 - t1, t2 - t0};
         return out;
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
+
+void PipelineQ::prepare(const ImageU8 &rgb) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
+    try {
+        impl_->prepared = false;
+        impl_->prepared_work = resize_long_side(rgb);
+        impl_->prepared_feats = impl_->encode_image(impl_->prepared_work);
+        impl_->prepared_id = fingerprint(rgb);
+        impl_->prepared = true;
     } catch (const Ort::Exception &e) {
         throw std::runtime_error(std::string("onnxruntime: ") + e.what());
     }
@@ -389,7 +435,24 @@ ImageU8 PipelineQ::run_plain(const ImageU8 &rgb, TimingsQ *timings) {
 
 ImageU8 PipelineQ::matte_and_compose(const ImageU8 &rgb, const ImageU8 &work, const Mask &mask) {
     std::vector<uint8_t> trimap = make_trimap(mask);
-    std::vector<float> alpha = impl_->matte(work, trimap);
+    // ViTMatte only on the trimap's non-background box plus a margin (matte_cropped in pipeline_vlm.py).
+    int x0 = work.w, y0 = work.h, x1 = -1, y1 = -1;
+    for (int y = 0; y < work.h; y++)
+        for (int x = 0; x < work.w; x++)
+            if (trimap[size_t(y) * work.w + x]) x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+    x0 = std::max(0, x0 - kMatteMargin), y0 = std::max(0, y0 - kMatteMargin);
+    x1 = std::min(work.w, x1 + 1 + kMatteMargin), y1 = std::min(work.h, y1 + 1 + kMatteMargin);
+    const int cw = x1 - x0, ch = y1 - y0;
+    ImageU8 crop(cw, ch, 3);
+    std::vector<uint8_t> crop_trimap(size_t(cw) * ch);
+    for (int y = 0; y < ch; y++) {
+        std::copy(work.row(y + y0) + size_t(x0) * 3, work.row(y + y0) + size_t(x1) * 3, crop.row(y));
+        std::copy(&trimap[size_t(y + y0) * work.w + x0], &trimap[size_t(y + y0) * work.w + x1], &crop_trimap[size_t(y) * cw]);
+    }
+    std::vector<float> crop_alpha = impl_->matte(crop, crop_trimap);
+    std::vector<float> alpha(size_t(work.w) * work.h, 0.f);
+    for (int y = 0; y < ch; y++)
+        std::copy(&crop_alpha[size_t(y) * cw], &crop_alpha[size_t(y) * cw] + cw, &alpha[size_t(y + y0) * work.w + x0]);
     std::vector<float> full(size_t(rgb.w) * rgb.h);
     resize_linear(alpha.data(), work.w, work.h, full.data(), rgb.w, rgb.h);
     ImageU8 out(rgb.w, rgb.h, 4);

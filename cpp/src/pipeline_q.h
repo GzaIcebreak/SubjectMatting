@@ -39,6 +39,8 @@ Mask complete_instance(const std::vector<float> &prob, int w, int h, const std::
 bool plain_background(const ImageU8 &work, std::array<double, 3> &bg);
 // Pixels that differ from the background colour, specks removed.
 Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg);
+// Whether run_plain would take this image (border uniform and something differs from it). No models involved.
+bool is_plain(const ImageU8 &rgb);
 
 struct TimingsQ {
     double sam3 = 0, matting = 0, total = 0;  // seconds
@@ -65,6 +67,10 @@ public:
 
     // rgb: 3-channel image; subjects in its pixel coordinates -> RGBA. Throws NothingSegmented or runtime_error.
     ImageU8 run(const ImageU8 &rgb, const std::vector<Subject> &subjects, TimingsQ *timings = nullptr);
+
+    // Encodes the image with SAM3's image encoder ahead of run() (e.g. while the caller waits for Qwen); run() on the
+    // same pixels then skips that step. Throws runtime_error.
+    void prepare(const ImageU8 &rgb);
 
     // Auto mode on a solid background: everything that isn't background, no SAM3. Throws NotPlain otherwise.
     // timings->sam3 holds the keying time.

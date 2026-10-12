@@ -4,7 +4,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(JobStore.self) private var store
-    @State private var key = APIKeyStore.load() ?? ""
+    @State private var key = QKey.shared.key ?? ""
     @State private var status: String?
 
     var body: some View {
@@ -33,11 +33,15 @@ struct SettingsView: View {
     }
 
     private func save() {
-        guard APIKeyStore.save(key) else {
-            status = "保存到钥匙串失败"
-            return
+        status = "正在保存…"
+        let saving = key
+        QKey.shared.save(saving) { ok in
+            guard ok else {
+                status = "保存到钥匙串失败"
+                return
+            }
+            status = saving.trimmingCharacters(in: .whitespaces).isEmpty ? "已删除" : "已保存"
+            store.restartWorker()
         }
-        status = key.trimmingCharacters(in: .whitespaces).isEmpty ? "已删除" : "已保存"
-        store.restartWorker()
     }
 }

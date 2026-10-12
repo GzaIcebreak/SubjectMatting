@@ -104,6 +104,35 @@ int smq_matte_plain(smq_context *ctx, const uint8_t *rgb, int width, int height,
     return SMQ_ERROR;
 }
 
+int smq_prepare(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, char *err, size_t err_len) {
+    if (!ctx || !rgb || width <= 0 || height <= 0 || stride < width * 3) {
+        set_error(err, err_len, "invalid arguments");
+        return SMQ_INVALID_ARGUMENTS;
+    }
+    try {
+        sm::ImageU8 img(width, height, 3);
+        for (int y = 0; y < height; y++) std::memcpy(img.row(y), rgb + size_t(y) * stride, size_t(width) * 3);
+        ctx->pipeline.prepare(img);
+        return SMQ_OK;
+    } catch (const std::exception &e) {
+        set_error(err, err_len, e.what());
+    } catch (...) {
+        set_error(err, err_len, "unknown error");
+    }
+    return SMQ_ERROR;
+}
+
+int smq_is_plain(const uint8_t *rgb, int width, int height, int stride) {
+    if (!rgb || width <= 0 || height <= 0 || stride < width * 3) return 0;
+    try {
+        sm::ImageU8 img(width, height, 3);
+        for (int y = 0; y < height; y++) std::memcpy(img.row(y), rgb + size_t(y) * stride, size_t(width) * 3);
+        return sm::is_plain(img) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 void smq_destroy(smq_context *ctx) { delete ctx; }
 
 }  // extern "C"

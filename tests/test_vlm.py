@@ -115,3 +115,23 @@ def test_plain_background_keys_out_everything_else_and_rejects_busy_borders():
     assert not m[5, 5] and not m[10, 280]
     busy = np.random.default_rng(0).integers(0, 255, (200, 300, 3), np.uint8)
     assert plain_background(PILImage.fromarray(busy)) is None
+
+
+def test_matte_cropped_runs_vitmatte_on_the_subject_area_only():
+    from PIL import Image as PILImage
+
+    from matting.pipeline_vlm import matte_box, matte_cropped
+
+    trimap = np.zeros((300, 400), np.uint8)
+    trimap[100:150, 200:260] = 128
+    trimap[110:140, 210:250] = 255
+    assert matte_box(trimap, margin=32) == (168, 68, 292, 182)
+    seen = []
+
+    def fake_matte(img, t):
+        seen.append(img.size)
+        return (t / 255.0).astype(np.float32)
+
+    alpha = matte_cropped(fake_matte, PILImage.new("RGB", (400, 300)), trimap)
+    assert seen == [(188, 178)]  # default margin 64
+    assert alpha[120, 230] == 1.0 and alpha[0, 0] == 0.0 and alpha.shape == (300, 400)

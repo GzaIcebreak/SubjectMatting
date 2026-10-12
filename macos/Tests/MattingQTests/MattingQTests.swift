@@ -29,3 +29,34 @@ final class QwenParseTests: XCTestCase {
         XCTAssertEqual(s.first?.label, "sign {stop]")
     }
 }
+
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
+
+/// The fast loader must place every pixel where the ImageIO thumbnail path (with EXIF transform) puts it.
+final class ImageOrientationTests: XCTestCase {
+    func testAllEightExifOrientationsMatchTheThumbnailPath() throws {
+        // An asymmetric 5x3 image with distinct pixels, saved as PNG with each orientation tag.
+        let w = 5, h = 3
+        var px = [UInt8](repeating: 255, count: w * h * 4)
+        for i in 0..<(w * h) { px[i * 4] = UInt8(i * 16); px[i * 4 + 1] = UInt8(255 - i * 16); px[i * 4 + 2] = UInt8((i * 37) % 256) }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let provider = CGDataProvider(data: Data(px) as CFData)!
+        let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: space,
+                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider,
+                            decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for o in 1...8 {
+            let url = dir.appendingPathComponent("o\(o).png")
+            let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+            CGImageDestinationAddImage(dest, image, [kCGImagePropertyOrientation: o] as CFDictionary)
+            XCTAssertTrue(CGImageDestinationFinalize(dest))
+            let fast = try ImageFiles.loadRGB(url), ref = try ImageFiles.loadRGBViaThumbnail(url)
+            XCTAssertEqual([fast.width, fast.height], [ref.width, ref.height], "orientation \(o)")
+            XCTAssertEqual(fast.pixels, ref.pixels, "orientation \(o)")
+        }
+    }
+}

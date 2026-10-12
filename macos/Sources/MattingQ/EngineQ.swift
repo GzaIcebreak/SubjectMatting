@@ -36,10 +36,16 @@ public final class MattingEngineQ {
         UnsafeMutablePointer<CChar>?, Int
     ) -> Int32
     private typealias Destroy = @convention(c) (OpaquePointer?) -> Void
+    private typealias Prepare = @convention(c) (
+        OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeMutablePointer<CChar>?, Int
+    ) -> Int32
+    private typealias IsPlain = @convention(c) (UnsafePointer<UInt8>?, Int32, Int32, Int32) -> Int32
 
     private let handle: UnsafeMutableRawPointer
     private let matteFn: Matte
     private let mattePlainFn: MattePlain
+    private let prepareFn: Prepare
+    private let isPlainFn: IsPlain
     private let destroyFn: Destroy
     private let ctx: OpaquePointer
 
@@ -55,6 +61,8 @@ public final class MattingEngineQ {
         let create = try symbol("smq_create", as: Create.self)
         matteFn = try symbol("smq_matte", as: Matte.self)
         mattePlainFn = try symbol("smq_matte_plain", as: MattePlain.self)
+        prepareFn = try symbol("smq_prepare", as: Prepare.self)
+        isPlainFn = try symbol("smq_is_plain", as: IsPlain.self)
         destroyFn = try symbol("smq_destroy", as: Destroy.self)
         var err = [CChar](repeating: 0, count: 512)
         let errLen = err.count
@@ -66,6 +74,20 @@ public final class MattingEngineQ {
 
     deinit {
         destroyFn(ctx)
+    }
+
+    /// Runs SAM3's image encoder now (while Qwen is being asked), so the next matte() on this image skips it.
+    public func prepare(rgb: [UInt8], width: Int, height: Int) throws {
+        var err = [CChar](repeating: 0, count: 512)
+        let errLen = err.count
+        if prepareFn(ctx, rgb, Int32(width), Int32(height), Int32(width * 3), &err, errLen) != 0 {
+            throw Failure.other(String(cString: err))
+        }
+    }
+
+    /// Whether mattePlain would take this image. Uses no models, so it can run on another thread.
+    public func isPlain(rgb: [UInt8], width: Int, height: Int) -> Bool {
+        isPlainFn(rgb, Int32(width), Int32(height), Int32(width * 3)) == 1
     }
 
     /// Auto mode on a solid background (no Qwen, no SAM3): nil when the background is not a plain colour.

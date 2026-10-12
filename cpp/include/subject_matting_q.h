@@ -68,6 +68,15 @@ SMQ_API int smq_matte(smq_context *ctx, const uint8_t *rgb, int width, int heigh
 SMQ_API int smq_matte_plain(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, uint8_t *out_rgba,
                             smq_timings *timings, char *err, size_t err_len);
 
+/*
+ * Optional: runs SAM3's image encoder now (e.g. while waiting for the vision-language model), so the next smq_matte
+ * on the same pixels starts from the encoded image. Returns SMQ_OK or SMQ_ERROR.
+ */
+SMQ_API int smq_prepare(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride, char *err, size_t err_len);
+
+/* 1 if smq_matte_plain would handle this image (solid background), else 0. Needs no context; thread safe. */
+SMQ_API int smq_is_plain(const uint8_t *rgb, int width, int height, int stride);
+
 SMQ_API void smq_destroy(smq_context *ctx);
 
 #ifdef __cplusplus

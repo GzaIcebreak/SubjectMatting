@@ -29,6 +29,7 @@ CORE_PROB = 0.5  # SAM3's own mask threshold: decides which object is the subjec
 EXTEND_PROB = 0.3  # lower threshold: completes parts SAM3 is unsure about (a white eagle head, a parrot's beak)
 CORE_MIN_RATIO = 0.05  # core pieces smaller than this x the largest one are specks
 DUPLICATE_SHARE = 0.5  # an instance this much inside a higher-scored kept one is a duplicate (often object + background)
+MATTE_MARGIN = 64  # ViTMatte runs on the trimap's non-background box plus this margin (pixels), not the whole image
 
 
 class NoSubjectError(RuntimeError):
@@ -99,6 +100,22 @@ def select_instances(inst: Instances, boxes: list, min_inside: float = MIN_INSID
     return sorted(kept)
 
 
+def matte_box(trimap: np.ndarray, margin: int = MATTE_MARGIN) -> tuple[int, int, int, int]:
+    """x0, y0, x1, y1: the trimap's non-background area plus `margin`, clipped to the image."""
+    h, w = trimap.shape
+    ys, xs = np.nonzero(trimap)
+    return (max(0, int(xs.min()) - margin), max(0, int(ys.min()) - margin),
+            min(w, int(xs.max()) + 1 + margin), min(h, int(ys.max()) + 1 + margin))  # fmt: skip
+
+
+def matte_cropped(matte, work: Image.Image, trimap: np.ndarray) -> np.ndarray:
+    """ViTMatte on matte_box only; certain background everywhere else."""
+    x0, y0, x1, y1 = matte_box(trimap)
+    alpha = np.zeros(trimap.shape, np.float32)
+    alpha[y0:y1, x0:x1] = matte(work.crop((x0, y0, x1, y1)), trimap[y0:y1, x0:x1])
+    return alpha
+
+
 def drop_duplicates(inst: Instances, idx: list[int], share: float = DUPLICATE_SHARE) -> list[int]:
     """Mask NMS by containment: highest score first, skip an instance when `share` of its mask is already covered
     by a kept one. SAM3 returns many such near-duplicates; at a lower threshold their extra pixels are background."""
@@ -158,7 +175,7 @@ class PipelineVlm:
     def _matte(self, img, work, mask, stages, extra) -> tuple[Image.Image, dict]:
         t = time.perf_counter()
         trimap = make_trimap(mask)
-        alpha = self.matte(work, trimap)
+        alpha = matte_cropped(self.matte, work, trimap)
         stages["matting"] = time.perf_counter() - t
         info = {"stages": stages, "total": sum(stages.values()), "mask": mask, "trimap": trimap, **extra}
         return compose_rgba(img, alpha), info

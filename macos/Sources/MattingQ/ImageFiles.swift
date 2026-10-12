@@ -23,20 +23,15 @@ public enum ImageFiles {
     public static func loadRGB(_ url: URL) throws -> RGB {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(source) > 0,
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let pw = props[kCGImagePropertyPixelWidth] as? Int, let ph = props[kCGImagePropertyPixelHeight] as? Int
+              let raw = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         else { throw Failure(description: "无法读取图片（格式不支持或文件已损坏）") }
-        // A "thumbnail" at full size is the documented way to get the EXIF orientation applied.
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(pw, ph),
-            kCGImageSourceShouldCacheImmediately: true,
-        ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            throw Failure(description: "无法解码图片")
-        }
-        let w = image.width, h = image.height
-        let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        // Decoding the image itself and applying the EXIF orientation while drawing is several times faster on large
+        // photos than asking ImageIO for a full-size "thumbnail" with the transform (which resamples).
+        let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let rw = raw.width, rh = raw.height
+        let swaps = (5...8).contains(orientation)
+        let w = swaps ? rh : rw, h = swaps ? rw : rh
+        let space = raw.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
         let drawn = rgba.withUnsafeMutableBytes { buf -> Bool in
             guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
@@ -45,7 +40,8 @@ public enum ImageFiles {
             ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
             ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
             ctx.interpolationQuality = .none
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.concatenate(orientationTransform(orientation, width: CGFloat(rw), height: CGFloat(rh)))
+            ctx.draw(raw, in: CGRect(x: 0, y: 0, width: rw, height: rh))
             return true
         }
         guard drawn else { throw Failure(description: "无法解码图片") }
@@ -56,6 +52,41 @@ public enum ImageFiles {
             rgb[i * 3 + 2] = rgba[i * 4 + 2]
         }
         return RGB(pixels: rgb, width: w, height: h, colorSpace: space)
+    }
+
+    /// Maps the stored image (width x height, CoreGraphics' y-up space) to its display orientation (EXIF 1...8).
+    static func orientationTransform(_ orientation: Int, width w: CGFloat, height h: CGFloat) -> CGAffineTransform {
+        switch orientation {
+        case 2: return CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0)  // mirror horizontally
+        case 3: return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)  // rotate 180
+        case 4: return CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h)  // mirror vertically
+        case 5: return CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: h, ty: w)  // transpose
+        case 6: return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)  // rotate 90 clockwise
+        case 7: return CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)  // transverse
+        case 8: return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)  // rotate 90 counter-clockwise
+        default: return .identity
+        }
+    }
+
+    /// The previous implementation (ImageIO full-size thumbnail with transform): the reference for the tests.
+    static func loadRGBViaThumbnail(_ url: URL) throws -> RGB {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let pw = props[kCGImagePropertyPixelWidth] as? Int, let ph = props[kCGImagePropertyPixelHeight] as? Int,
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: max(pw, ph),
+              ] as CFDictionary)
+        else { throw Failure(description: "thumbnail failed") }
+        let w = image.width, h = image.height
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        rgba.withUnsafeMutableBytes { buf in
+            let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: space,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        return RGB(pixels: stride(from: 0, to: rgba.count, by: 4).flatMap { rgba[$0..<($0 + 3)] }, width: w, height: h, colorSpace: space)
     }
 
     /// rgba: straight (non-premultiplied) alpha.

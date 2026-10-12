@@ -7,13 +7,14 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Called on every worker (re)start, so a key saved in Settings is picked up by restartWorker().
-    let store = JobStore { WorkerProcess(extraEnvironment: QKey.environment(), executableName: "matting-worker-q") }
+    let store = JobStore { WorkerProcess(extraEnvironment: QKey.shared.environment(), executableName: "matting-worker-q") }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Also needed when the bare binary is run outside the .app during development.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        store.start()
+        // The worker needs the API key; reading it may wait on a Keychain prompt, so not on the main thread.
+        QKey.shared.load { [store] in store.start() }
     }
 
     /// Images or folders dropped on the Dock icon or opened with "Open With".
