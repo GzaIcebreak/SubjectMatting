@@ -49,3 +49,32 @@ install(FILES include/subject_matting.h DESTINATION include)
 # The ONNX Runtime library ships next to ours (found through @loader_path / $ORIGIN).
 file(GLOB ONNXRUNTIME_SHARED_FILES "${ONNXRUNTIME_DIR}/lib/libonnxruntime*.dylib" "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so*")
 install(FILES ${ONNXRUNTIME_SHARED_FILES} DESTINATION lib)
+
+# ---------------------------------------------------------------------------------------------------------------
+# Pipeline Q (subjects from a vision-language model -> EfficientSAM3 -> ViTMatte): a separate library and CLI.
+set(SMQ_SOURCES src/c_api_q.cpp src/pipeline_q.cpp src/clip_tokenizer.cpp src/pipeline.cpp src/image_ops.cpp)
+
+add_library(subject_matting_q SHARED ${SMQ_SOURCES})
+target_include_directories(subject_matting_q PUBLIC include PRIVATE src "${ONNXRUNTIME_INCLUDE_DIR}")
+target_link_libraries(subject_matting_q PRIVATE "${ONNXRUNTIME_LIBRARY}")
+target_compile_definitions(subject_matting_q PRIVATE SM_VERSION="${PROJECT_VERSION}" SM_BUILDING_DLL)
+set_target_properties(subject_matting_q PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+  VERSION ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}
+  BUILD_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
+  INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>")
+
+# The CLI also calls the tokenizer directly (--tokenize), so it links the sources statically.
+add_library(smq_static STATIC ${SMQ_SOURCES})
+target_include_directories(smq_static PUBLIC include src "${ONNXRUNTIME_INCLUDE_DIR}")
+target_link_libraries(smq_static PUBLIC "${ONNXRUNTIME_LIBRARY}")
+target_compile_definitions(smq_static PRIVATE SM_VERSION="${PROJECT_VERSION}")
+
+add_executable(smq_cli tools/smq_cli.cpp)
+target_include_directories(smq_cli PRIVATE third_party)
+target_link_libraries(smq_cli PRIVATE smq_static)
+
+install(TARGETS subject_matting_q LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+install(FILES include/subject_matting_q.h DESTINATION include)
