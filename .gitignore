@@ -15,3 +15,4 @@ cpp/third_party/onnxruntime/
 .env
 third_party/
 onnx_models_sam3/
+onnx_models_q/

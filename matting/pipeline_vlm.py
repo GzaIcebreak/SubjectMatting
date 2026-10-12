@@ -1,7 +1,7 @@
 """Pipeline Q: Qwen-VL finds the subject(s) -> EfficientSAM3 segments them -> trimap -> ViTMatte.
 
-Qwen returns each subject as an English noun phrase plus a box. SAM3 is prompted with the phrase and the box
-(as an exemplar) and returns every instance of the concept; the ones that lie mostly inside a Qwen box are kept.
+Qwen returns each subject as an English noun phrase plus a box. For each subject SAM3 is prompted with the phrase
+and the box (as an exemplar) and returns every instance of the concept; the ones mostly inside the box are kept.
 That way SAM3, not the box, decides where an object ends (a tight box doesn't cut it off), while the box decides
 which instance is meant ("the cat on the right"). Each kept instance is then completed and cleaned with pipeline
 A's fuse_masks (see complete_instance), so edges go through the same steps as the SAM2 route: fuse -> trimap ->
@@ -11,7 +11,6 @@ ViTMatte. Lives next to pipeline_a.py and only calls its helpers.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
@@ -130,21 +129,15 @@ class PipelineVlm:
 
         t = time.perf_counter()
         state = self.sam.set_image(work)
-        by_label: dict[str, list[Subject]] = defaultdict(list)
-        for s in det.subjects:
-            by_label[s.label].append(s)
         mask = np.zeros((work.height, work.width), bool)
         choices: list[Choice] = []
-        for label, subjects in by_label.items():
-            inst = self.sam.find(state, label, [s.box for s in subjects])
-            picked = {s_i: select_instances(inst, [s.box]) for s_i, s in enumerate(subjects)}
-            unique = set(drop_duplicates(inst, sorted({i for p in picked.values() for i in p})))
-            for s_i, s in enumerate(subjects):
-                kept = [i for i in picked[s_i] if i in unique]
-                unique -= set(kept)  # an instance completes once, inside the first box that picked it
-                choices.append(Choice(s, kept, [float(inst.scores[i]) for i in kept]))
-                for i in kept:
-                    mask |= complete_instance(inst.probs[i], s.box)
+        # One decoder pass per subject, its box as the only exemplar (the ONNX decoder takes exactly one box).
+        for s in det.subjects:
+            inst = self.sam.find(state, s.label, [s.box])
+            kept = drop_duplicates(inst, select_instances(inst, [s.box]))
+            choices.append(Choice(s, kept, [float(inst.scores[i]) for i in kept]))
+            for i in kept:
+                mask |= complete_instance(inst.probs[i], s.box)
         stages["sam3"] = time.perf_counter() - t
         if not mask.any():
             raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
