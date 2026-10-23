@@ -35,7 +35,7 @@ struct SubjectMattingQApp: App {
     private var store: JobStore { delegate.store }
 
     var body: some Scene {
-        Window("SubjectMatting Q", id: "main") {
+        Window("抠图demo", id: "main") {
             ContentView()
                 .environment(store)
                 .frame(minWidth: 820, minHeight: 520)

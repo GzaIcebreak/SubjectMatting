@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds "dist/SubjectMatting Q.app": the SwiftUI front end and matting-worker-q (macos/), libsubject_matting_q with
+# Builds "dist/抠图demo.app" (SubjectMatting Q): the SwiftUI front end and matting-worker-q (macos/), libsubject_matting_q with
 # ONNX Runtime (cpp/), the EfficientSAM3 + ViTMatte fp16 models and the CLIP BPE merges, ad-hoc signed.
 # Prerequisites:
 #   PYTHONPATH=.:third_party/efficientsam3/sam3 .venv/bin/python scripts/export_sam3_onnx.py  -> onnx_models_q/
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/dist/SubjectMatting Q.app"
+APP="$ROOT/dist/抠图demo.app"
 CPP_BUILD="$ROOT/cpp/build"
 MODELS="$ROOT/onnx_models_q"
 

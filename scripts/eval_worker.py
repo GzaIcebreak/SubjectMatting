@@ -1,6 +1,6 @@
 """The hard cases (eval/hard_cases.json) through the app's own worker, end to end over its JSON-lines protocol.
 
-    .venv/bin/python scripts/eval_worker.py ["dist/SubjectMatting Q.app"] [--out outputs/eval_worker]
+    .venv/bin/python scripts/eval_worker.py ["dist/抠图demo.app"] [--out outputs/eval_worker]
 
 The API key comes from $DASHSCOPE_API_KEY or .env (as for matting/qwen.py); the worker's log goes to <out>/worker.log.
 """
@@ -25,7 +25,7 @@ from scripts.eval_hard import BG_MAX, FG_MIN, point_alpha  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("app", nargs="?", default="dist/SubjectMatting Q.app")
+    ap.add_argument("app", nargs="?", default="dist/抠图demo.app")
     ap.add_argument("--cases", default="eval/hard_cases.json")
     ap.add_argument("--images", default="test_images/hard")
     ap.add_argument("--out", default="outputs/eval_worker")

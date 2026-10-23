@@ -29,7 +29,7 @@ public enum APIKeyStore {
         if trimmed.isEmpty { return true }
         var add = base
         add[kSecValueData] = Data(trimmed.utf8)
-        add[kSecAttrLabel] = "SubjectMatting Q：阿里云百炼 API Key"
+        add[kSecAttrLabel] = "抠图demo：阿里云百炼 API Key"
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 }

@@ -48,9 +48,9 @@ SUBJECTMATTING_WORKER="macos/.build/debug/matting-worker --lib cpp/build/libsubj
 本库 0.14 MB + ONNX Runtime 33 MB + fp16 模型 208 MB，结果与 Python 版逐像素一致。
 模型用 `scripts/export_onnx.py` 导出，Python 参考实现是 `matting/pipeline_onnx.py`（额外依赖见 `requirements-onnx.txt`）。
 
-## SubjectMatting Q（分支 `feat/qwen-sam3`）
+## SubjectMatting Q / 抠图demo（分支 `feat/qwen-sam3`）
 
-另一个独立 app：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），本地模型（颜色抠图 / EfficientSAM3）
+另一个独立 app（显示名「抠图demo」，`scripts/build_macos_app_q.sh` → `dist/抠图demo.app`）：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），本地模型（颜色抠图 / EfficientSAM3）
 提出候选，有歧义时由第二个 Qwen 模型挑选，ViTMatte 处理边缘。
 设计、评测和实现记录见 [docs/2026-10-12-qwen-sam3-report.md](docs/2026-10-12-qwen-sam3-report.md)。
 
