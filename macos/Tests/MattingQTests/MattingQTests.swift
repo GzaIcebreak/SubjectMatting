@@ -60,3 +60,54 @@ final class ImageOrientationTests: XCTestCase {
         }
     }
 }
+
+/// tests/test_vlm.py's cases for remove regions, the judge's reply and the repairs.
+final class QwenDetectionTests: XCTestCase {
+    func testRemoveRegions() throws {
+        let d = try QwenClient.parseDetection(#"{"subjects": [{"label": "girl", "box_2d": [100, 100, 500, 900]}], "remove": [{"label": "checkerboard", "box_2d": [600, 600, 700, 800]}]}"#, width: 1000, height: 1000)
+        XCTAssertEqual(d.subjects.map(\.label), ["girl"])
+        XCTAssertEqual(d.remove, [QwenSubject(label: "checkerboard", box: [600, 600, 700, 800])])
+    }
+
+    func testBoxWithoutBracketsAndTrailingCommas() throws {
+        let d = try QwenClient.parseDetection(#"{"subjects": [{"label": "umpire", "box_2d": 37, 421, 251, 969},], "remove": []}"#, width: 1000, height: 1000)
+        XCTAssertEqual(d.subjects, [QwenSubject(label: "umpire", box: [37, 421, 251, 969])])
+        XCTAssertEqual(d.remove, [])
+    }
+
+    func testKeepTakesTheLastAnswer() throws {
+        XCTAssertEqual(try QwenClient.parseKeep(#"candidate 1 looks like a chair... {"keep": [3, 1, 9]}"#, count: 3), [0, 2])
+        XCTAssertThrowsError(try QwenClient.parseKeep("no idea", count: 3))
+    }
+}
+
+final class ImageHelperTests: XCTestCase {
+    func testCandidateSheetLayout() throws {
+        let img = ImageFiles.RGB(pixels: [UInt8](repeating: 200, count: 40 * 20 * 3), width: 40, height: 20,
+                                 colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        var m = [UInt8](repeating: 0, count: 40 * 20)
+        m[10 * 40 + 20] = 1
+        let sheet = try ImageFiles.candidateSheet(img, masks: Array(repeating: m, count: 4), maskWidth: 40, maskHeight: 20, tileLongSide: 40)
+        XCTAssertEqual([sheet.width, sheet.height], [120, 40])  // 3 per row, 2 rows
+        XCTAssertLessThan(sheet.pixels[(19 * 120 + 39) * 3], 60)  // dimmed outside the candidate
+    }
+
+    func testAlphaOfATransparentPNGIsKept() throws {
+        let w = 4, h = 2
+        var px = [UInt8](repeating: 255, count: w * h * 4)
+        px[3] = 0  // top-left transparent
+        px[4 * 1 + 3] = 128
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: space,
+                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: CGDataProvider(data: Data(px) as CFData)!,
+                            decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        let rgb = try ImageFiles.loadRGB(url)
+        XCTAssertEqual(rgb.alpha?.prefix(3).map { Int($0) }, [0, 128, 255])
+        XCTAssertEqual(Array(rgb.pixels.prefix(3)), [255, 255, 255])  // transparent composited onto white
+    }
+}

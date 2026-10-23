@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreText
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -16,6 +17,9 @@ public enum ImageFiles {
         public var width: Int
         public var height: Int
         public var colorSpace: CGColorSpace
+        /// The file's own alpha (width*height, upright), nil when it has none or is fully opaque. What is
+        /// transparent there stays transparent in the result.
+        public var alpha: [UInt8]? = nil
     }
 
     /// Like matting.common.load_rgb: upright, transparent areas composited onto white. Pixels stay in the
@@ -51,7 +55,32 @@ public enum ImageFiles {
             rgb[i * 3 + 1] = rgba[i * 4 + 1]
             rgb[i * 3 + 2] = rgba[i * 4 + 2]
         }
-        return RGB(pixels: rgb, width: w, height: h, colorSpace: space)
+        return RGB(pixels: rgb, width: w, height: h, colorSpace: space, alpha: alphaChannel(raw, orientation: orientation))
+    }
+
+    static func alphaChannel(_ raw: CGImage, orientation: Int) -> [UInt8]? {
+        switch raw.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return nil
+        default: break
+        }
+        let rw = raw.width, rh = raw.height
+        let swaps = (5...8).contains(orientation)
+        let w = swaps ? rh : rw, h = swaps ? rw : rh
+        // Drawn onto transparent black; the alpha channel is the file's alpha.
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = rgba.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            ctx.interpolationQuality = .none
+            ctx.concatenate(orientationTransform(orientation, width: CGFloat(rw), height: CGFloat(rh)))
+            ctx.draw(raw, in: CGRect(x: 0, y: 0, width: rw, height: rh))
+            return true
+        }
+        let alpha = stride(from: 3, to: rgba.count, by: 4).map { rgba[$0] }
+        guard drawn, alpha.contains(where: { $0 < 255 }) else { return nil }
+        return alpha
     }
 
     /// Maps the stored image (width x height, CoreGraphics' y-up space) to its display orientation (EXIF 1...8).
@@ -128,5 +157,78 @@ public enum ImageFiles {
         CGImageDestinationAddImage(dest, small, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw Failure(description: "无法编码 JPEG") }
         return out as Data
+    }
+
+    /// RGB pixels resized to w x h (high-quality interpolation).
+    static func resized(_ img: RGB, width w: Int, height h: Int) -> [UInt8]? {
+        var rgba = [UInt8](repeating: 255, count: img.width * img.height * 4)
+        for i in 0..<(img.width * img.height) {
+            rgba[i * 4] = img.pixels[i * 3]
+            rgba[i * 4 + 1] = img.pixels[i * 3 + 1]
+            rgba[i * 4 + 2] = img.pixels[i * 3 + 2]
+        }
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let full = CGImage(width: img.width, height: img.height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: img.width * 4,
+                                 space: img.colorSpace, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                 provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        let ok = out.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: img.colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            else { return false }
+            ctx.interpolationQuality = .high
+            ctx.draw(full, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { return nil }
+        return stride(from: 0, to: out.count, by: 4).flatMap { out[$0..<($0 + 3)] }
+    }
+
+    /// The judge's picture (like matting.qwen.candidate_sheet): one tile per candidate mask (maskWidth x maskHeight,
+    /// one byte per pixel), the image dimmed outside the candidate, numbered 1...n in the corner, 3 tiles per row.
+    public static func candidateSheet(_ img: RGB, masks: [[UInt8]], maskWidth: Int, maskHeight: Int, tileLongSide: Int = 384) throws -> RGB {
+        let s = Double(tileLongSide) / Double(max(img.width, img.height))
+        let tw = max(1, Int((Double(img.width) * s).rounded())), th = max(1, Int((Double(img.height) * s).rounded()))
+        guard let small = resized(img, width: tw, height: th) else { throw Failure(description: "无法缩放图片") }
+        let cols = min(masks.count, 3), rows = (masks.count + cols - 1) / cols
+        let sw = cols * tw, sh = rows * th
+        var sheet = [UInt8](repeating: 0, count: sw * sh * 4)
+        for (k, m) in masks.enumerated() {
+            let ox = (k % cols) * tw, oy = (k / cols) * th
+            for y in 0..<th {
+                let my = min(maskHeight - 1, Int((Double(y) + 0.5) * Double(maskHeight) / Double(th)))
+                for x in 0..<tw {
+                    let mx = min(maskWidth - 1, Int((Double(x) + 0.5) * Double(maskWidth) / Double(tw)))
+                    let inside = m[my * maskWidth + mx] != 0
+                    let src = (y * tw + x) * 3, dst = ((oy + y) * sw + ox + x) * 4
+                    for c in 0..<3 {
+                        let v = Double(small[src + c])
+                        sheet[dst + c] = UInt8(min(255, inside ? v : v * 0.15 + (c == 2 ? 12 : 0)))
+                    }
+                    sheet[dst + 3] = 255
+                }
+            }
+        }
+        // Numbers: red with a white outline, top-left of each tile. CoreGraphics' origin is bottom-left.
+        sheet.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: sw, height: sh, bitsPerComponent: 8, bytesPerRow: sw * 4,
+                                      space: img.colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            else { return }
+            let size = CGFloat(max(16, th / 10))
+            let font = CTFontCreateWithName("Helvetica-Bold" as CFString, size, nil)
+            for k in masks.indices {
+                let ox = CGFloat((k % cols) * tw), top = CGFloat(sh - (k / cols) * th)
+                for (stroke, color) in [(CGFloat(6), CGColor(red: 1, green: 1, blue: 1, alpha: 1)), (CGFloat(0), CGColor(red: 1, green: 0.16, blue: 0.16, alpha: 1))] {
+                    let attrs: [CFString: Any] = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: color,
+                                                  kCTStrokeColorAttributeName: color, kCTStrokeWidthAttributeName: stroke]
+                    let line = CTLineCreateWithAttributedString(CFAttributedStringCreate(nil, "\(k + 1)" as CFString, attrs as CFDictionary))
+                    ctx.textPosition = CGPoint(x: ox + 6, y: top - size - 2)
+                    CTLineDraw(line, ctx)
+                }
+            }
+        }
+        let rgb = stride(from: 0, to: sheet.count, by: 4).flatMap { sheet[$0..<($0 + 3)] }
+        return RGB(pixels: rgb, width: sw, height: sh, colorSpace: img.colorSpace)
     }
 }

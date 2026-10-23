@@ -50,8 +50,18 @@ SUBJECTMATTING_WORKER="macos/.build/debug/matting-worker --lib cpp/build/libsubj
 
 ## SubjectMatting Q（分支 `feat/qwen-sam3`）
 
-另一个独立 app：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），EfficientSAM3 分割，ViTMatte 处理边缘。
+另一个独立 app：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），本地模型（颜色抠图 / EfficientSAM3）
+提出候选，有歧义时由第二个 Qwen 模型挑选，ViTMatte 处理边缘。
 设计、评测和实现记录见 [docs/2026-10-12-qwen-sam3-report.md](docs/2026-10-12-qwen-sam3-report.md)。
+
+疑难图评测（图片放在 `test_images/hard/`）：
+
+```bash
+PYTHONPATH=.:third_party/efficientsam3/sam3 .venv/bin/python scripts/eval_hard.py
+```
+```bash
+.venv/bin/python scripts/eval_worker.py
+```
 
 ```bash
 PYTHONPATH=.:third_party/efficientsam3/sam3 .venv/bin/python scripts/export_sam3_onnx.py
