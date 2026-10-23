@@ -5,6 +5,10 @@
 
 Subjects come from bench_vlm.py's Qwen cache when it exists (no API calls), else from a few fixed boxes on
 synthetic images. Fails when an alpha differs by more than --max-mean (1/255 units) on average or IoU < --min-iou.
+
+--steps IMAGE...: the step-by-step API (smq_candidates / smq_remove / smq_matte_mask, every candidate kept) against
+PipelineVlmOnnx.run in auto mode with the judge off. Qwen's subjects and remove regions for each image are asked once
+and cached in --steps-cache.
 """
 
 from __future__ import annotations
@@ -22,15 +26,33 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from matting.common import load_rgb, resize_long_side  # noqa: E402
 from matting.pipeline_vlm_onnx import PipelineVlmOnnx  # noqa: E402
+from matting.plain_background import key_mask, plain_background  # noqa: E402
 from matting.qwen import Detection, Subject  # noqa: E402
 
 
 class FixedDetector:
     def __init__(self):
         self.subjects: list[Subject] = []
+        self.remove: list[Subject] = []
 
     def detect(self, img, instruction=None):
-        return Detection(self.subjects, "fixed", 0.0)
+        return Detection(self.subjects, "fixed", 0.0, remove=self.remove)
+
+
+def steps_detections(images: list[str], cache: Path) -> dict:
+    """image -> {"subjects": [[label, box]], "remove": [...]} in work pixels, asked from Qwen once."""
+    data = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
+    missing = [i for i in images if i not in data]
+    if missing:
+        from matting.qwen import QwenDetector
+
+        q = QwenDetector()
+        for i in missing:
+            det = q.detect(resize_long_side(load_rgb(i)))
+            data[i] = {"subjects": [[s.label, list(s.box)] for s in det.subjects], "remove": [[r.label, list(r.box)] for r in det.remove]}
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return data
 
 
 def cases(cache: Path, tmp: Path):
@@ -63,17 +85,22 @@ def main() -> int:
     ap.add_argument("--min-iou", type=float, default=0.99)
     ap.add_argument("--plain-only", action="store_true", help="skip the cached subject cases")
     ap.add_argument("--plain", nargs="*", default=[], help="solid-background images for the fast path (default: synthetic)")
+    ap.add_argument("--steps", nargs="*", default=None, help="images for the step-by-step API (only these are checked)")
+    ap.add_argument("--steps-cache", default="outputs/parity_steps_qwen.json")
     args = ap.parse_args()
+    if args.steps is not None:
+        return check_steps(args)
 
     tmp = Path(tempfile.mkdtemp())
     det = FixedDetector()
-    ref = PipelineVlmOnnx(args.models, args.precision, detector=det)
+    ref = PipelineVlmOnnx(args.models, args.precision, detector=det, judge=False)
     failed = total = 0
     for png, subjects in (cases(Path(args.cache), tmp) if not args.plain_only else []):
         img = Image.open(png).convert("RGB")
         work = resize_long_side(img)
         det.subjects = subjects
-        a = np.asarray(ref.run(img)[0])[..., 3].astype(np.float64)
+        # smq_matte: SAM3 for the given subjects, every instance kept (an instruction turns the colour key off).
+        a = np.asarray(ref.run(img, "parity")[0])[..., 3].astype(np.float64)
         sx, sy = img.width / work.width, img.height / work.height  # work pixels -> input pixels for the C API
         specs = [f"{s.label}:{s.box[0] * sx},{s.box[1] * sy},{s.box[2] * sx},{s.box[3] * sy}" for s in subjects]
         out = tmp / f"out_{png.name}"
@@ -105,7 +132,8 @@ def main() -> int:
         png = tmp / f"plain_in_{src.stem}.png"
         load_rgb(src).save(png)
         img = Image.open(png).convert("RGB")
-        a = np.asarray(ref.run(img)[0])[..., 3].astype(np.float64)  # auto mode -> plain path
+        work = resize_long_side(img)  # smq_matte_plain: the bare colour key, no holes filled
+        a = np.asarray(ref._matte(img, work, key_mask(work, plain_background(work)), {}, {})[0])[..., 3].astype(np.float64)
         out = tmp / f"plain_out_{src.stem}.png"
         r = subprocess.run([args.cli, "--models", args.models, "--precision", args.precision, "--plain", str(png), str(out)],
                            capture_output=True, text=True)  # fmt: skip
@@ -120,6 +148,44 @@ def main() -> int:
         failed += not ok
         print(f"{'PASS' if ok else 'FAIL'} plain {src.stem[:16]:16s} mean|diff| {mean:.4f}/255  max {np.abs(a - b).max():.0f}")
     print(f"{total - failed}/{total} passed")
+    return 1 if failed else 0
+
+
+def check_steps(args) -> int:
+    tmp = Path(tempfile.mkdtemp())
+    det = FixedDetector()
+    ref = PipelineVlmOnnx(args.models, args.precision, detector=det, judge=False)
+    detections = steps_detections(args.steps, Path(args.steps_cache))
+    failed = 0
+    for src in args.steps:
+        png = tmp / (Path(src).stem + ".png")
+        load_rgb(src).save(png)
+        img = Image.open(png).convert("RGB")
+        work = resize_long_side(img)
+        d = detections[src]
+        det.subjects = [Subject(l, tuple(b)) for l, b in d["subjects"]]
+        det.remove = [Subject(l, tuple(b)) for l, b in d["remove"]]
+        a_img, info = ref.run(img)
+        a = np.asarray(a_img)[..., 3].astype(np.float64)
+        sx, sy = img.width / work.width, img.height / work.height
+        spec = lambda s: f"{s.label}:{s.box[0] * sx},{s.box[1] * sy},{s.box[2] * sx},{s.box[3] * sy}"  # noqa: E731
+        cmd = [args.cli, "--models", args.models, "--precision", args.precision, "--steps", str(png), str(tmp / f"out_{png.name}")]
+        cmd += [spec(s) for s in det.subjects]
+        for r in det.remove:
+            cmd += ["--remove", spec(r)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            failed += 1
+            print(f"FAIL {png.stem}: smq_cli exit {r.returncode}: {r.stderr.strip()[:200]}")
+            continue
+        b = np.asarray(Image.open(tmp / f"out_{png.name}"))[..., 3].astype(np.float64)
+        mean = np.abs(a - b).mean()
+        ma, mb = a > 127.5, b > 127.5
+        iou = (ma & mb).sum() / max((ma | mb).sum(), 1)
+        ok = mean <= args.max_mean and iou >= args.min_iou
+        failed += not ok
+        print(f"{'PASS' if ok else 'FAIL'} steps {png.stem:16s} mean|diff| {mean:.4f}/255  IoU {iou:.5f}  [{info['summary']}]  cli: {r.stdout.splitlines()[0]}")
+    print(f"{len(args.steps) - failed}/{len(args.steps)} passed")
     return 1 if failed else 0
 
 

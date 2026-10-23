@@ -41,6 +41,21 @@ bool plain_background(const ImageU8 &work, std::array<double, 3> &bg);
 Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg);
 // Whether run_plain would take this image (border uniform and something differs from it). No models involved.
 bool is_plain(const ImageU8 &rgb);
+// mask plus every region of ~mask not connected to the border (4-connectivity).
+Mask fill_holes(const Mask &mask);
+// The colour key's connected pieces with their holes filled, largest first.
+std::vector<Mask> key_candidates(const ImageU8 &work, const std::array<double, 3> &bg);
+// seed plus the pixels of `within` connected to it whose colour (quantized) also occurs in it, near the box.
+Mask grow_like(const Mask &seed, const Mask &within, const ImageU8 &work, const std::array<double, 4> &box);
+// Share of the box (work pixels) covered by the mask.
+double box_cover(const Mask &mask, const std::array<double, 4> &box);
+
+// A proposed piece of the subject at work size: owner is the index of the subject it was segmented for, -1 for a
+// colour-key piece.
+struct Candidate {
+    Mask mask;
+    int owner;
+};
 
 struct TimingsQ {
     double sam3 = 0, matting = 0, total = 0;  // seconds
@@ -76,7 +91,20 @@ public:
     // timings->sam3 holds the keying time.
     ImageU8 run_plain(const ImageU8 &rgb, TimingsQ *timings = nullptr);
 
+    // The step-by-step API (matting/pipeline_vlm.py run()); the caller decides which candidates to keep. Masks are at
+    // work size (resize_long_side of rgb); subjects and regions in rgb's pixels.
+    // Candidates: with auto_key on a solid background the colour key's pieces (*used_key = true), else SAM3's
+    // completed instances for each subject. SAM3's image encoding is kept for remove() on the same pixels.
+    std::vector<Candidate> candidates(const ImageU8 &rgb, const std::vector<Subject> &subjects, bool auto_key,
+                                      bool *used_key = nullptr);
+    // Cuts the see-through regions out of mask (in place).
+    void remove(const ImageU8 &rgb, Mask &mask, const std::vector<Subject> &regions);
+    // Trimap + ViTMatte for a work-size mask -> RGBA at rgb's size. Releases the cached SAM3 encoding.
+    ImageU8 matte_mask(const ImageU8 &rgb, const Mask &mask);
+
 private:
+    struct Feats;
+    Feats &feats_for(const ImageU8 &rgb, ImageU8 &work);
     ImageU8 matte_and_compose(const ImageU8 &rgb, const ImageU8 &work, const Mask &mask);
 
     struct Impl;

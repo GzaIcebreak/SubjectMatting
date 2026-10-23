@@ -28,6 +28,11 @@ constexpr double kUniformShare = 0.95;
 constexpr double kKeyTol = 24;
 constexpr double kMinArea = 0.0005;
 constexpr int kMatteMargin = 64;  // matting/pipeline_vlm.py MATTE_MARGIN
+constexpr double kRemoveMinCover = 0.1;  // REMOVE_MIN_COVER
+constexpr double kRemoveMaxArea = 0.25;  // REMOVE_MAX_AREA
+constexpr int kGrowQuant = 8;            // GROW_QUANT
+constexpr int kGrowMinCount = 5;         // GROW_MIN_COUNT
+constexpr double kGrowReach = 1.0;       // GROW_REACH
 
 double now() {
     using namespace std::chrono;
@@ -185,6 +190,91 @@ bool is_plain(const ImageU8 &rgb) {
     return plain_background(work, bg) && key_mask(work, bg).any();
 }
 
+Mask fill_holes(const Mask &mask) {
+    const int w = mask.w, h = mask.h;
+    std::vector<uint8_t> outside(mask.data.size(), 0);
+    std::vector<int> stack;
+    auto push = [&](int x, int y) {
+        size_t i = size_t(y) * w + x;
+        if (!mask.data[i] && !outside[i]) outside[i] = 1, stack.push_back(int(i));
+    };
+    for (int x = 0; x < w; x++) push(x, 0), push(x, h - 1);
+    for (int y = 0; y < h; y++) push(0, y), push(w - 1, y);
+    while (!stack.empty()) {
+        int i = stack.back();
+        stack.pop_back();
+        int x = i % w, y = i / w;
+        if (x > 0) push(x - 1, y);
+        if (x < w - 1) push(x + 1, y);
+        if (y > 0) push(x, y - 1);
+        if (y < h - 1) push(x, y + 1);
+    }
+    Mask out(w, h);
+    for (size_t i = 0; i < out.data.size(); i++) out.data[i] = !outside[i];
+    return out;
+}
+
+std::vector<Mask> key_candidates(const ImageU8 &work, const std::array<double, 3> &bg) {
+    Mask fg = key_mask(work, bg);
+    std::vector<Mask> out;
+    for (Mask &piece : largest_components(fg, 0.0))
+        if (double(piece.count()) >= kMinArea * double(fg.data.size())) out.push_back(fill_holes(piece));
+    return out;
+}
+
+Mask grow_like(const Mask &seed, const Mask &within, const ImageU8 &work, const std::array<double, 4> &box) {
+    if (!seed.any()) return seed;
+    const int w = seed.w, h = seed.h, n = 256 / kGrowQuant;
+    auto key = [&](size_t i) {
+        const uint8_t *p = work.data.data() + i * 3;
+        return (p[0] / kGrowQuant * n + p[1] / kGrowQuant) * n + p[2] / kGrowQuant;
+    };
+    std::vector<int> counts(size_t(n) * n * n, 0);
+    for (size_t i = 0; i < seed.data.size(); i++)
+        if (seed.data[i]) counts[key(i)]++;
+    std::vector<uint8_t> palette(counts.size(), 0);
+    for (int v = 0; v < int(counts.size()); v++) {
+        if (counts[v] < kGrowMinCount) continue;
+        int r = v / (n * n), g = (v / n) % n, b = v % n;
+        for (int dr = -1; dr <= 1; dr++)
+            for (int dg = -1; dg <= 1; dg++)
+                for (int db = -1; db <= 1; db++) {
+                    // numpy keys may run past a channel's range and alias a neighbour; the same arithmetic here.
+                    long k = (long(r + dr) * n + g + dg) * n + b + db;
+                    if (k >= 0 && k < long(palette.size())) palette[k] = 1;
+                }
+    }
+    const double mx = (box[2] - box[0]) * kGrowReach, my = (box[3] - box[1]) * kGrowReach;
+    const int xa = std::max(0, int(box[0] - mx)), ya = std::max(0, int(box[1] - my));
+    const int xb = std::min(w, int(std::ceil(box[2] + mx))), yb = std::min(h, int(std::ceil(box[3] + my)));
+    Mask alike(w, h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            size_t i = size_t(y) * w + x;
+            bool near = x >= xa && x < xb && y >= ya && y < yb;
+            alike.data[i] = seed.data[i] || (near && within.data[i] && palette[key(i)]);
+        }
+    std::vector<int32_t> labels;
+    int nl = connected_components(alike, labels);
+    std::vector<uint8_t> hit(nl, 0);
+    for (size_t i = 0; i < labels.size(); i++)
+        if (seed.data[i]) hit[labels[i]] = 1;
+    Mask out(w, h);
+    for (size_t i = 0; i < labels.size(); i++) out.data[i] = labels[i] > 0 && hit[labels[i]];
+    return out;
+}
+
+double box_cover(const Mask &mask, const std::array<double, 4> &box) {
+    // Python: int(round(v)) with banker's rounding, then clipped.
+    int x1 = std::max(0, int(round_half_even(box[0]))), y1 = std::max(0, int(round_half_even(box[1])));
+    int x2 = std::min(mask.w, int(round_half_even(box[2]))), y2 = std::min(mask.h, int(round_half_even(box[3])));
+    double area = std::max(1, (x2 - x1) * (y2 - y1));
+    size_t covered = 0;
+    for (int y = y1; y < y2; y++)
+        for (int x = x1; x < x2; x++) covered += mask.at(x, y) != 0;
+    return double(covered) / area;
+}
+
 namespace {
 
 // Cheap identity check for prepare(): size plus a sample of the pixels.
@@ -199,6 +289,10 @@ uint64_t fingerprint(const ImageU8 &img) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Models
+
+struct PipelineQ::Feats {
+    std::vector<float> fpn0, fpn1, fpn2, pos2;
+};
 
 struct PipelineQ::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "subject_matting_q"};
@@ -217,9 +311,7 @@ struct PipelineQ::Impl {
         return std::vector<float>(p, p + v.GetTensorTypeAndShapeInfo().GetElementCount());
     }
 
-    struct Feats {
-        std::vector<float> fpn0, fpn1, fpn2, pos2;
-    };
+    using Feats = PipelineQ::Feats;
 
     // prepare() result, used once by the next run() on the same pixels.
     bool prepared = false;
@@ -428,6 +520,96 @@ ImageU8 PipelineQ::run_plain(const ImageU8 &rgb, TimingsQ *timings) {
         double t2 = now();
         if (timings) *timings = {t1 - t0, t2 - t1, t2 - t0};
         return out;
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
+
+PipelineQ::Feats &PipelineQ::feats_for(const ImageU8 &rgb, ImageU8 &work) {
+    uint64_t id = fingerprint(rgb);
+    if (!impl_->prepared || impl_->prepared_id != id) {
+        impl_->prepared = false;
+        impl_->prepared_work = resize_long_side(rgb);
+        impl_->prepared_feats = impl_->encode_image(impl_->prepared_work);
+        impl_->prepared_id = id;
+        impl_->prepared = true;
+    }
+    work = impl_->prepared_work;
+    return impl_->prepared_feats;
+}
+
+std::vector<Candidate> PipelineQ::candidates(const ImageU8 &rgb, const std::vector<Subject> &subjects, bool auto_key,
+                                             bool *used_key) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
+    try {
+        std::vector<Candidate> out;
+        if (used_key) *used_key = false;
+        if (auto_key) {
+            ImageU8 work = resize_long_side(rgb);
+            std::array<double, 3> bg{};
+            if (plain_background(work, bg))
+                for (Mask &m : key_candidates(work, bg)) out.push_back({std::move(m), -1});
+            if (!out.empty()) {
+                if (used_key) *used_key = true;
+                return out;
+            }
+        }
+        ImageU8 work;
+        Feats &feats = feats_for(rgb, work);
+        const int w = work.w, h = work.h;
+        const double sx = double(w) / rgb.w, sy = double(h) / rgb.h;
+        for (int k = 0; k < int(subjects.size()); k++) {
+            const Subject &s = subjects[k];
+            std::array<double, 4> box{s.box[0] * sx, s.box[1] * sy, s.box[2] * sx, s.box[3] * sy};
+            Instances inst = impl_->find(feats, s.label, box, w, h);
+            for (int i : drop_duplicates(inst, select_instances(inst, box))) {
+                Mask m = complete_instance(inst.probs[i], w, h, box);
+                if (m.any()) out.push_back({std::move(m), k});
+            }
+        }
+        return out;
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
+
+void PipelineQ::remove(const ImageU8 &rgb, Mask &mask, const std::vector<Subject> &regions) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
+    try {
+        const ImageU8 plain_work = resize_long_side(rgb);
+        if (mask.w != plain_work.w || mask.h != plain_work.h) throw std::runtime_error("mask is not at work size");
+        const int w = mask.w, h = mask.h;
+        const double sx = double(w) / rgb.w, sy = double(h) / rgb.h;
+        for (const Subject &r : regions) {
+            std::array<double, 4> box{r.box[0] * sx, r.box[1] * sy, r.box[2] * sx, r.box[3] * sy};
+            if ((box[2] - box[0]) * (box[3] - box[1]) > kRemoveMaxArea * w * h || box_cover(mask, box) < kRemoveMinCover)
+                continue;
+            ImageU8 work;
+            Feats &feats = feats_for(rgb, work);
+            Instances inst = impl_->find(feats, r.label, box, w, h);
+            for (int i : select_instances(inst, box)) {
+                Mask seed = complete_instance(inst.probs[i], w, h, box);
+                for (size_t k = 0; k < seed.data.size(); k++) seed.data[k] &= mask.data[k];
+                Mask cut = grow_like(seed, mask, work, box);
+                for (size_t k = 0; k < cut.data.size(); k++)
+                    if (cut.data[k]) mask.data[k] = 0;
+            }
+        }
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
+
+ImageU8 PipelineQ::matte_mask(const ImageU8 &rgb, const Mask &mask) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
+    if (!mask.any()) throw NothingSegmented("empty mask");
+    try {
+        impl_->prepared = false;
+        impl_->prepared_feats = Feats();
+        impl_->prepared_work = ImageU8();
+        ImageU8 work = resize_long_side(rgb);
+        if (mask.w != work.w || mask.h != work.h) throw std::runtime_error("mask is not at work size");
+        return matte_and_compose(rgb, work, mask);
     } catch (const Ort::Exception &e) {
         throw std::runtime_error(std::string("onnxruntime: ") + e.what());
     }
