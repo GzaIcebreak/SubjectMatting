@@ -85,10 +85,11 @@ class OnnxSam3:
 class PipelineVlmOnnx(PipelineVlm):
     name = "Q (ONNX): Qwen-VL + EfficientSAM3 + ViTMatte"
 
-    def __init__(self, models_dir: str | Path = "onnx_models_q", precision: str = "fp16", qwen_model: str = "qwen3-vl-plus", detector=None):
-        from .qwen import QwenDetector
+    def __init__(self, models_dir: str | Path = "onnx_models_q", precision: str = "fp16", qwen_model: str = "qwen3-vl-plus", detector=None, judge=None):
+        from .qwen import QwenDetector, QwenJudge
 
         self.detector = detector or QwenDetector(qwen_model)
+        self.judge = judge if judge is not None else QwenJudge(detector=self.detector)
         self.sam = OnnxSam3(models_dir, precision)
         self.matte = OnnxViTMatte(Path(models_dir) / "vitmatte.fp16.onnx")
 

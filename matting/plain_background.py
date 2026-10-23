@@ -1,12 +1,15 @@
 """Plain-background fast path for pipeline Q's auto mode.
 
-Product shots and renders often sit on a solid background. There the subject is simply everything that differs from
-the background colour - including parts a segmentation model might not count as "the object" (a model's base, a
-pedestal) - and no vision-language model or SAM3 run is needed. Ported to C++ in cpp/src/pipeline_q.cpp.
+Product shots and renders often sit on a solid background. There the subject is everything that differs from the
+background colour - including parts a segmentation model might not count as "the object" (a model's base, a
+pedestal) - so the colour key, not SAM3, proposes the candidates: its connected pieces with their enclosed holes
+filled (white teeth on a white background are not background). Which pieces are the subject and which holes are
+really see-through is decided by Qwen (pipeline_vlm). Ported to C++ in cpp/src/pipeline_q.cpp.
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -36,3 +39,18 @@ def key_mask(work: Image.Image, bg: np.ndarray) -> np.ndarray:
     fg = np.abs(a - bg).max(axis=2) > KEY_TOL
     keep = [c for c in largest_components(fg, min_ratio=0.0) if c.sum() >= MIN_AREA * fg.size]
     return np.logical_or.reduce(keep) if keep else np.zeros(fg.shape, bool)
+
+
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    """mask plus every region of ~mask not connected to the image border (4-connectivity)."""
+    n, labels = cv2.connectedComponents((~mask).astype(np.uint8), connectivity=4)
+    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    outside = np.isin(labels, border[border > 0])
+    return ~outside
+
+
+def key_candidates(work: Image.Image, bg: np.ndarray) -> list[np.ndarray]:
+    """The colour key's connected pieces, holes filled, largest first."""
+    fg = key_mask(work, bg)
+    pieces = largest_components(fg, min_ratio=0.0)
+    return [fill_holes(p) for p in pieces if p.sum() >= MIN_AREA * fg.size]

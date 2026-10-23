@@ -47,6 +47,15 @@ def load_rgb(path: str | Path) -> Image.Image:
     return img.convert("RGB")
 
 
+def load_alpha(path: str | Path) -> np.ndarray | None:
+    """The image's own alpha channel (uint8, upright like load_rgb), or None when it has none / is fully opaque."""
+    img = ImageOps.exif_transpose(Image.open(path))
+    if img.mode not in ("RGBA", "LA", "P", "PA"):
+        return None
+    a = np.asarray(img.convert("RGBA"))[..., 3]
+    return a if a.min() < 255 else None
+
+
 def resize_long_side(img: Image.Image, long_side: int = WORK_LONG_SIDE) -> Image.Image:
     w, h = img.size
     scale = long_side / max(w, h)

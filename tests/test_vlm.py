@@ -135,3 +135,66 @@ def test_matte_cropped_runs_vitmatte_on_the_subject_area_only():
     alpha = matte_cropped(fake_matte, PILImage.new("RGB", (400, 300)), trimap)
     assert seen == [(188, 178)]  # default margin 64
     assert alpha[120, 230] == 1.0 and alpha[0, 0] == 0.0 and alpha.shape == (300, 400)
+
+
+# --- candidates, judge, remove regions ---
+
+from matting.pipeline_vlm import grow_like, needs_judge  # noqa: E402
+from matting.plain_background import fill_holes, key_candidates  # noqa: E402
+from matting.qwen import parse_detection, parse_keep  # noqa: E402
+from PIL import Image  # noqa: E402
+
+
+def test_parse_detection_reads_remove_regions():
+    text = '{"subjects": [{"label": "girl", "box_2d": [100, 100, 500, 900]}], "remove": [{"label": "checkerboard", "box_2d": [600, 600, 700, 800]}]}'
+    subjects, remove = parse_detection(text, 1000, 1000)
+    assert [s.label for s in subjects] == ["girl"]
+    assert remove[0].label == "checkerboard" and remove[0].box == (600, 600, 700, 800)
+
+
+def test_parse_detection_repairs_box_without_brackets_and_trailing_commas():
+    text = '{"subjects": [{"label": "umpire", "box_2d": 37, 421, 251, 969},], "remove": []}'
+    (s,), remove = parse_detection(text, 1000, 1000)
+    assert s.box == (37, 421, 251, 969) and remove == []
+
+
+def test_parse_keep_takes_the_last_answer_and_drops_bad_numbers():
+    assert parse_keep('candidate 1 looks like a chair... {"keep": [3, 1, 9]}', 3) == [0, 2]
+    with pytest.raises(QwenError):
+        parse_keep("no idea", 3)
+
+
+def test_needs_judge_only_when_a_subject_has_several_candidates():
+    assert not needs_judge([0, 1])
+    assert needs_judge([0, 0, 1])
+    assert not needs_judge([None])
+    assert needs_judge([None, None])
+
+
+def test_fill_holes_fills_enclosed_but_not_open_notches():
+    m = np.zeros((20, 20), bool)
+    m[2:18, 2:18] = True
+    m[6:9, 6:9] = False  # enclosed hole (teeth)
+    m[10:13, 2:8] = False  # notch open to the outside
+    f = fill_holes(m)
+    assert f[7, 7] and not f[11, 3]
+
+
+def test_key_candidates_keeps_white_teeth_in_a_face_on_white():
+    a = np.full((60, 60, 3), 255, np.uint8)
+    a[10:50, 10:50] = (230, 170, 140)  # face
+    a[30:35, 20:40] = 255  # white teeth
+    (c,) = key_candidates(Image.fromarray(a), np.array([255, 255, 255]))
+    assert c[32, 30] and not c[2, 2]
+
+
+def test_grow_like_takes_connected_look_alikes_but_not_distant_ones():
+    rgb = np.zeros((40, 40, 3), np.uint8)
+    rgb[:] = (200, 30, 30)  # balloon
+    rgb[5:15, 5:25] = (230, 230, 230)  # checkerboard notch, SAM3 found only part of it
+    rgb[30:34, 30:34] = (230, 230, 230)  # white teeth elsewhere
+    within = np.ones((40, 40), bool)
+    seed = np.zeros((40, 40), bool)
+    seed[5:15, 15:25] = True
+    g = grow_like(seed, within, rgb, (15, 5, 25, 15))
+    assert g[10, 6] and not g[32, 32] and not g[20, 20]

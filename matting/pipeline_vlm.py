@@ -1,4 +1,14 @@
-"""Pipeline Q: Qwen-VL finds the subject(s) -> EfficientSAM3 segments them -> trimap -> ViTMatte.
+"""Pipeline Q: Qwen-VL finds the subject(s) -> local models propose candidates -> Qwen judges -> trimap -> ViTMatte.
+
+Hand-written rules decided too much (colour = subject, inside the box = subject) and each failed somewhere: white
+teeth keyed out on a white background, the chair inside a loose cat box. Now the local models only propose and
+Qwen decides:
+  1. Qwen-VL: the subjects (label + box) and the regions inside them that must become transparent (remove).
+  2. Candidates: on a solid background the colour key's pieces (holes filled), otherwise SAM3's instances for each
+     subject (completed as below).
+  3. When that is ambiguous (several candidates for one subject, several key pieces), a second Qwen call
+     (QwenJudge) looks at the numbered candidates and keeps those that belong to the subjects.
+  4. Each remove region is segmented by SAM3 and cut out, within its box.
 
 Qwen returns each subject as an English noun phrase plus a box. For each subject SAM3 is prompted with the phrase
 and the box (as an exemplar) and returns every instance of the concept; the ones mostly inside the box are kept.
@@ -10,16 +20,18 @@ ViTMatte. Lives next to pipeline_a.py and only calls its helpers.
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from .common import ViTMatte, compose_rgba, largest_components, make_trimap, resize_long_side
 from .pipeline_a import SAFETY_PAD, fuse_masks, pad_box
-from .plain_background import key_mask, plain_background
-from .qwen import Detection, QwenDetector, Subject
+from .plain_background import key_candidates, plain_background
+from .qwen import Detection, QwenDetector, QwenError, QwenJudge, Subject
 from .sam3 import EfficientSam3, Instances
 
 MIN_INSIDE = 0.5  # share of an instance's mask that must fall inside a (slightly enlarged) Qwen box
@@ -30,6 +42,11 @@ EXTEND_PROB = 0.3  # lower threshold: completes parts SAM3 is unsure about (a wh
 CORE_MIN_RATIO = 0.05  # core pieces smaller than this x the largest one are specks
 DUPLICATE_SHARE = 0.5  # an instance this much inside a higher-scored kept one is a duplicate (often object + background)
 MATTE_MARGIN = 64  # ViTMatte runs on the trimap's non-background box plus this margin (pixels), not the whole image
+REMOVE_MIN_COVER = 0.1  # a remove region is segmented only if the subject mask covers this much of its box
+REMOVE_MAX_AREA = 0.25  # holes and gaps are small: a bigger remove box is ordinary background (wall, grass), ignored
+GROW_QUANT = 8  # remove regions grow over pixels whose colour (quantized to this step, +-1 step) occurs in them
+GROW_MIN_COUNT = 5  # ... at least this many times
+GROW_REACH = 1.0  # ... within the remove box enlarged by this x its size on each side
 
 
 class NoSubjectError(RuntimeError):
@@ -127,27 +144,64 @@ def drop_duplicates(inst: Instances, idx: list[int], share: float = DUPLICATE_SH
     return sorted(kept)
 
 
+def needs_judge(owners: list[int | None]) -> bool:
+    """owners: the subject index of each candidate (None for colour-key pieces). Unambiguous when every subject has
+    at most one candidate (and there is at most one key piece)."""
+    return any(owners.count(o) > 1 for o in set(owners))
+
+
+def grow_like(seed: np.ndarray, within: np.ndarray, rgb: np.ndarray, box, q: int = GROW_QUANT,
+              min_count: int = GROW_MIN_COUNT, reach: float = GROW_REACH) -> np.ndarray:
+    """seed plus the pixels of `within` connected to it whose colour also occurs in it, near the box.
+
+    SAM3 finds the core of a see-through region (a checkerboard in a notch) but stops short where it fades out; the
+    rest looks the same, so it is taken by appearance. Pixels that look alike but are not connected through
+    look-alike pixels (white teeth vs a white checkerboard cell) stay."""
+    if not seed.any():
+        return seed
+    n = 256 // q
+    qi = (rgb // q).astype(np.int64)
+    key = (qi[..., 0] * n + qi[..., 1]) * n + qi[..., 2]
+    vals, counts = np.unique(key[seed], return_counts=True)
+    palette = set()
+    for v in vals[counts >= min_count]:
+        r, g, b = v // (n * n), (v // n) % n, v % n
+        for dr, dg, db in itertools.product((-1, 0, 1), repeat=3):
+            palette.add(((r + dr) * n + g + dg) * n + b + db)
+    h, w = seed.shape
+    x1, y1, x2, y2 = box
+    mx, my = (x2 - x1) * reach, (y2 - y1) * reach
+    near = np.zeros(seed.shape, bool)
+    near[max(0, int(y1 - my)): min(h, int(np.ceil(y2 + my))), max(0, int(x1 - mx)): min(w, int(np.ceil(x2 + mx)))] = True
+    alike = np.isin(key, np.fromiter(palette, np.int64)) & within & near
+    _, labels = cv2.connectedComponents((alike | seed).astype(np.uint8), connectivity=8)
+    ids = np.unique(labels[seed])
+    return np.isin(labels, ids[ids > 0])
+
+
+def box_cover(mask: np.ndarray, box) -> float:
+    """Share of the box covered by the mask."""
+    h, w = mask.shape
+    x1, y1, x2, y2 = (int(round(v)) for v in box)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    area = max(1, (x2 - x1) * (y2 - y1))
+    return float(mask[y1:y2, x1:x2].sum()) / area
+
+
 class PipelineVlm:
     name = "Q: Qwen-VL + EfficientSAM3 + ViTMatte"
 
-    def __init__(self, qwen_model: str = "qwen3-vl-plus", sam_variant: str = "efficientvit", detector=None):
+    def __init__(self, qwen_model: str = "qwen3-vl-plus", sam_variant: str = "efficientvit", detector=None, judge=None):
         self.detector = detector or QwenDetector(qwen_model)
+        self.judge = judge if judge is not None else QwenJudge(detector=self.detector)
         self.sam = EfficientSam3(sam_variant)
         self.matte = ViTMatte()
 
-    def run(self, img: Image.Image, instruction: str | None = None) -> tuple[Image.Image, dict]:
+    def run(self, img: Image.Image, instruction: str | None = None, alpha_in: np.ndarray | None = None) -> tuple[Image.Image, dict]:
+        """alpha_in: the input's own alpha channel (H x W uint8, at img size), if it has one: what is transparent
+        there stays transparent."""
         stages: dict[str, float] = {}
         work = resize_long_side(img)
-
-        if instruction is None:
-            # Solid background: the subject is everything that isn't background; no Qwen, no SAM3.
-            t = time.perf_counter()
-            bg = plain_background(work)
-            mask = key_mask(work, bg) if bg is not None else None
-            stages["key"] = time.perf_counter() - t
-            if mask is not None and mask.any():
-                return self._matte(img, work, mask, stages, {"detection": None, "choices": [], "background": bg})
-            del stages["key"]
 
         t = time.perf_counter()
         det: Detection = self.detector.detect(work, instruction)
@@ -155,22 +209,72 @@ class PipelineVlm:
         if not det.subjects:
             raise NoSubjectError(f"图中没找到：{instruction}" if instruction else "没有识别到主体")
 
+        # Candidates: the colour key on a solid background (auto mode), else SAM3 per subject.
         t = time.perf_counter()
-        state = self.sam.set_image(work)
-        mask = np.zeros((work.height, work.width), bool)
+        bg = plain_background(work) if instruction is None else None
+        state = None
+        candidates: list[np.ndarray] = []
+        owners: list[int | None] = []
         choices: list[Choice] = []
-        # One decoder pass per subject, its box as the only exemplar (the ONNX decoder takes exactly one box).
-        for s in det.subjects:
-            inst = self.sam.find(state, s.label, [s.box])
-            kept = drop_duplicates(inst, select_instances(inst, [s.box]))
-            choices.append(Choice(s, kept, [float(inst.scores[i]) for i in kept]))
-            for i in kept:
-                mask |= complete_instance(inst.probs[i], s.box)
-        stages["sam3"] = time.perf_counter() - t
+        if bg is not None:
+            candidates = key_candidates(work, bg)
+            owners = [None] * len(candidates)
+            stages["key"] = time.perf_counter() - t
+        if not candidates:
+            bg = None
+            state = self.sam.set_image(work)
+            # One decoder pass per subject, its box as the only exemplar (the ONNX decoder takes exactly one box).
+            for k, s in enumerate(det.subjects):
+                inst = self.sam.find(state, s.label, [s.box])
+                kept = drop_duplicates(inst, select_instances(inst, [s.box]))
+                choices.append(Choice(s, kept, [float(inst.scores[i]) for i in kept]))
+                for i in kept:
+                    m = complete_instance(inst.probs[i], s.box)
+                    if m.any():
+                        candidates.append(m)
+                        owners.append(k)
+            stages["sam3"] = time.perf_counter() - t
+        if not candidates:
+            raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
+
+        keep = list(range(len(candidates)))
+        if self.judge and needs_judge(owners):
+            t = time.perf_counter()
+            try:
+                keep = self.judge.judge(work, det.subjects, candidates, instruction) or keep
+            except QwenError:
+                pass  # no second opinion: keep every candidate, as before
+            stages["judge"] = time.perf_counter() - t
+        mask = np.logical_or.reduce([candidates[i] for i in keep])
+
+        # Cut out what Qwen says is see-through, where the mask actually covers it.
+        removed = []
+        rgb = np.asarray(work.convert("RGB"))
+        for r in det.remove:
+            x1, y1, x2, y2 = r.box
+            if (x2 - x1) * (y2 - y1) > REMOVE_MAX_AREA * work.width * work.height or box_cover(mask, r.box) < REMOVE_MIN_COVER:
+                continue
+            t = time.perf_counter()
+            if state is None:
+                state = self.sam.set_image(work)
+            inst = self.sam.find(state, r.label, [r.box])
+            for i in select_instances(inst, [r.box]):
+                seed = complete_instance(inst.probs[i], r.box) & mask  # same completion as a subject: core + what touches it
+                mask &= ~grow_like(seed, mask, rgb, r.box)
+            removed.append(r.label)
+            stages["remove"] = stages.get("remove", 0.0) + time.perf_counter() - t
         if not mask.any():
             raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
 
-        return self._matte(img, work, mask, stages, {"detection": det, "choices": choices})
+        summary = f"{[s.label for s in det.subjects]} {'key' if bg is not None else 'sam3'} {len(candidates)} cand keep {[i + 1 for i in keep]}"
+        if removed:
+            summary += f" removed {removed}"
+        rgba, info = self._matte(img, work, mask, stages, {"detection": det, "choices": choices, "background": bg, "summary": summary})
+        if alpha_in is not None:
+            a = np.asarray(rgba).copy()
+            a[..., 3] = np.minimum(a[..., 3], alpha_in)
+            rgba = Image.fromarray(a, "RGBA")
+        return rgba, info
 
     def _matte(self, img, work, mask, stages, extra) -> tuple[Image.Image, dict]:
         t = time.perf_counter()

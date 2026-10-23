@@ -1,0 +1,19 @@
+{
+  "_doc": "Hard cases for pipeline Q. Images live in test_images/hard/ (not in git). Points are (x, y) relative to the image; fg points must come out opaque (mean alpha > 0.8 around the point), bg points transparent (< 0.2). An empty fg/bg list only checks that the image goes through.",
+  "cases": [
+    {"image": "castle3.png", "fg": [[0.47, 0.15], [0.3, 0.68], [0.5, 0.88], [0.15, 0.6]], "bg": [[0.03, 0.03], [0.95, 0.3], [0.97, 0.97]]},
+    {"image": "castle1.png", "fg": [[0.49, 0.1], [0.55, 0.73], [0.5, 0.92]], "bg": [[0.05, 0.05], [0.95, 0.5]]},
+    {"image": "castle3.png", "instruction": "火车", "fg": [[0.3, 0.68]], "bg": [[0.47, 0.15], [0.5, 0.88], [0.03, 0.03]]},
+    {"image": "thirty.png", "fg": [[0.49, 0.252], [0.45, 0.2], [0.6, 0.36], [0.6, 0.75], [0.2, 0.14]], "bg": [[0.69, 0.75], [0.69, 0.7], [0.69, 0.8], [0.285, 0.179], [0.265, 0.27], [0.9, 0.1]]},
+    {"image": "orange_cat.jpg", "fg": [[0.43, 0.3], [0.5, 0.7], [0.45, 0.9]], "bg": [[0.08, 0.5], [0.85, 0.2], [0.95, 0.85]]},
+    {"image": "dog_person.jpg", "fg": [[0.38, 0.6], [0.65, 0.6]], "bg": [[0.5, 0.3], [0.8, 0.85], [0.5, 0.1]]},
+    {"image": "two_cats.jpg", "fg": [[0.17, 0.5], [0.75, 0.4]], "bg": [[0.5, 0.9], [0.9, 0.85], [0.1, 0.11]]},
+    {"image": "two_cats.jpg", "instruction": "左边那只猫", "fg": [[0.17, 0.5]], "bg": [[0.75, 0.4], [0.5, 0.9]]},
+    {"image": "teddy_bears.jpg", "fg": [[0.3, 0.75], [0.2, 0.3], [0.6, 0.2]], "bg": [[0.93, 0.85]]},
+    {"image": "baseball.jpg", "fg": [[0.66, 0.5], [0.37, 0.65], [0.13, 0.55]], "bg": [[0.5, 0.45], [0.5, 0.2], [0.8, 0.9]]},
+    {"image": "parrot.png", "fg": [[0.4, 0.4], [0.8, 0.6]], "bg": [[0.95, 0.1], [0.95, 0.95]]},
+    {"image": "sign.png", "fg": [[0.3, 0.36]], "bg": [[0.5, 0.1], [0.5, 0.9]]},
+    {"image": "groceries.jpg", "fg": [], "bg": []},
+    {"image": "office.png", "fg": [], "bg": []}
+  ]
+}
