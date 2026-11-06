@@ -52,7 +52,9 @@ SUBJECTMATTING_WORKER="macos/.build/debug/matting-worker --lib cpp/build/libsubj
 
 另一个独立 app（显示名「抠图demo」，`scripts/build_macos_app_q.sh` → `dist/抠图demo.app`）：Qwen-VL（阿里云百炼）识别要抠的主体（自动，或按用户一句话的要求），本地模型（颜色抠图 / EfficientSAM3）
 提出候选，有歧义时由第二个 Qwen 模型挑选，ViTMatte 处理边缘。
+Q 分支另加入 BiRefNet_lite + ViTMatte 细节候选，经过目标范围、结构完整性和视觉评审后选择整张结果；不确定、光学材质有风险或细节流程失败时保留原流程。此组合无需训练，但会增加推理耗时，自动评审也可能误选；它不是所有图片都优于原流程的保证。打包需要 `onnx_models/birefnet_lite.fp16.onnx`。开发诊断可用 `SUBJECTMATTING_HYBRID=0` 关闭组合步骤。
 设计、评测和实现记录见 [docs/2026-10-12-qwen-sam3-report.md](docs/2026-10-12-qwen-sam3-report.md)。
+外轮廓扩张保护、47例回归及保守取舍见 [2026-11-05 诊断记录](docs/diagnostics/2026-11-05-exterior-growth.md)。
 
 疑难图评测（图片放在 `test_images/hard/`）：
 

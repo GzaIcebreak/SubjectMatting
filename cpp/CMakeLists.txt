@@ -78,3 +78,6 @@ target_link_libraries(smq_cli PRIVATE smq_static)
 
 install(TARGETS subject_matting_q LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(FILES include/subject_matting_q.h DESTINATION include)
+
+add_executable(smq_structure_test tests/q_structure_test.cpp)
+target_link_libraries(smq_structure_test PRIVATE smq_static)

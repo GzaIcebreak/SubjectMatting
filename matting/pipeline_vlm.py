@@ -1,21 +1,8 @@
-"""Pipeline Q: Qwen-VL finds the subject(s) -> local models propose candidates -> Qwen judges -> trimap -> ViTMatte.
-
-Hand-written rules decided too much (colour = subject, inside the box = subject) and each failed somewhere: white
-teeth keyed out on a white background, the chair inside a loose cat box. Now the local models only propose and
-Qwen decides:
-  1. Qwen-VL: the subjects (label + box) and the regions inside them that must become transparent (remove).
-  2. Candidates: on a solid background the colour key's pieces (holes filled), otherwise SAM3's instances for each
-     subject (completed as below).
-  3. When that is ambiguous (several candidates for one subject, several key pieces), a second Qwen call
-     (QwenJudge) looks at the numbered candidates and keeps those that belong to the subjects.
-  4. Each remove region is segmented by SAM3 and cut out, within its box.
-
-Qwen returns each subject as an English noun phrase plus a box. For each subject SAM3 is prompted with the phrase
-and the box (as an exemplar) and returns every instance of the concept; the ones mostly inside the box are kept.
-That way SAM3, not the box, decides where an object ends (a tight box doesn't cut it off), while the box decides
-which instance is meant ("the cat on the right"). Each kept instance is then completed and cleaned with pipeline
-A's fuse_masks (see complete_instance), so edges go through the same steps as the SAM2 route: fuse -> trimap ->
-ViTMatte. Lives next to pipeline_a.py and only calls its helpers.
+"""Q pipeline: semantic localization, topology-preserving candidates, conservative matting.
+Colour-key components preserve holes and small details. Overlapping complementary SAM3
+candidates are merged per subject; only disjoint alternatives need semantic judging.
+Semantic remove boxes are recorded but not subtracted: colour agreement is insufficient
+background evidence. Q-only trimap constraints preserve narrow branches and known holes.
 """
 
 from __future__ import annotations
@@ -30,7 +17,7 @@ from PIL import Image
 
 from .common import ViTMatte, compose_rgba, largest_components, make_trimap, resize_long_side
 from .pipeline_a import SAFETY_PAD, fuse_masks, pad_box
-from .plain_background import key_candidates, plain_background
+from .plain_background import key_candidates, plain_background, fill_holes
 from .qwen import Detection, QwenDetector, QwenError, QwenJudge, Subject
 from .sam3 import EfficientSam3, Instances
 
@@ -40,7 +27,7 @@ FALLBACK_IOU = 0.3  # a box with no instance inside takes its best-overlapping i
 CORE_PROB = 0.5  # SAM3's own mask threshold: decides which object is the subject
 EXTEND_PROB = 0.3  # lower threshold: completes parts SAM3 is unsure about (a white eagle head, a parrot's beak)
 CORE_MIN_RATIO = 0.05  # core pieces smaller than this x the largest one are specks
-DUPLICATE_SHARE = 0.5  # an instance this much inside a higher-scored kept one is a duplicate (often object + background)
+DUPLICATE_SHARE = 0.98  # an instance this much inside a higher-scored kept one is a duplicate (often object + background)
 MATTE_MARGIN = 64  # ViTMatte runs on the trimap's non-background box plus this margin (pixels), not the whole image
 REMOVE_MIN_COVER = 0.1  # a remove region is segmented only if the subject mask covers this much of its box
 REMOVE_MAX_AREA = 0.25  # holes and gaps are small: a bigger remove box is ordinary background (wall, grass), ignored
@@ -144,6 +131,18 @@ def drop_duplicates(inst: Instances, idx: list[int], share: float = DUPLICATE_SH
     return sorted(kept)
 
 
+def make_trimap_q(mask):
+    trimap = make_trimap(mask)
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
+    padded = np.pad(dist, 1)
+    l, r = padded[1:-1, :-2], padded[1:-1, 2:]
+    u, d = padded[:-2, 1:-1], padded[2:, 1:-1]
+    ridge = ((dist > l) & (dist >= r)) | ((dist > u) & (dist >= d))
+    trimap[mask & ridge] = 255
+    trimap[fill_holes(mask) & ~mask] = 0
+    return trimap
+
+
 def needs_judge(owners: list[int | None]) -> bool:
     """owners: the subject index of each candidate (None for colour-key pieces). Unambiguous when every subject has
     at most one candidate (and there is at most one key piece)."""
@@ -228,17 +227,25 @@ class PipelineVlm:
                 inst = self.sam.find(state, s.label, [s.box])
                 kept = drop_duplicates(inst, select_instances(inst, [s.box]))
                 choices.append(Choice(s, kept, [float(inst.scores[i]) for i in kept]))
+                groups = []
                 for i in kept:
                     m = complete_instance(inst.probs[i], s.box)
-                    if m.any():
-                        candidates.append(m)
-                        owners.append(k)
+                    if not m.any(): continue
+                    g = 0
+                    while g < len(groups):
+                        if np.any(m & groups[g]):
+                            m |= groups.pop(g)
+                            g = 0
+                        else: g += 1
+                    groups.append(m)
+                candidates.extend(groups)
+                owners.extend([k] * len(groups))
             stages["sam3"] = time.perf_counter() - t
         if not candidates:
             raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
 
         keep = list(range(len(candidates)))
-        if self.judge and needs_judge(owners):
+        if bg is None and self.judge and needs_judge(owners):
             t = time.perf_counter()
             try:
                 keep = self.judge.judge(work, det.subjects, candidates, instruction) or keep
@@ -247,22 +254,8 @@ class PipelineVlm:
             stages["judge"] = time.perf_counter() - t
         mask = np.logical_or.reduce([candidates[i] for i in keep])
 
-        # Cut out what Qwen says is see-through, where the mask actually covers it.
+        # Semantic boxes/colour similarity are not pixel evidence for subtraction.
         removed = []
-        rgb = np.asarray(work.convert("RGB"))
-        for r in det.remove:
-            x1, y1, x2, y2 = r.box
-            if (x2 - x1) * (y2 - y1) > REMOVE_MAX_AREA * work.width * work.height or box_cover(mask, r.box) < REMOVE_MIN_COVER:
-                continue
-            t = time.perf_counter()
-            if state is None:
-                state = self.sam.set_image(work)
-            inst = self.sam.find(state, r.label, [r.box])
-            for i in select_instances(inst, [r.box]):
-                seed = complete_instance(inst.probs[i], r.box) & mask  # same completion as a subject: core + what touches it
-                mask &= ~grow_like(seed, mask, rgb, r.box)
-            removed.append(r.label)
-            stages["remove"] = stages.get("remove", 0.0) + time.perf_counter() - t
         if not mask.any():
             raise NoSubjectError("SAM3 没有在 Qwen 给出的位置分割出对象")
 
@@ -278,7 +271,7 @@ class PipelineVlm:
 
     def _matte(self, img, work, mask, stages, extra) -> tuple[Image.Image, dict]:
         t = time.perf_counter()
-        trimap = make_trimap(mask)
+        trimap = make_trimap_q(mask)
         alpha = matte_cropped(self.matte, work, trimap)
         stages["matting"] = time.perf_counter() - t
         info = {"stages": stages, "total": sum(stages.values()), "mask": mask, "trimap": trimap, **extra}

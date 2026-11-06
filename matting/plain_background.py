@@ -1,10 +1,6 @@
-"""Plain-background fast path for pipeline Q's auto mode.
-
-Product shots and renders often sit on a solid background. There the subject is everything that differs from the
-background colour - including parts a segmentation model might not count as "the object" (a model's base, a
-pedestal) - so the colour key, not SAM3, proposes the candidates: its connected pieces with their enclosed holes
-filled (white teeth on a white background are not background). Which pieces are the subject and which holes are
-really see-through is decided by Qwen (pipeline_vlm). Ported to C++ in cpp/src/pipeline_q.cpp.
+"""Plain-background candidates preserving their measured holes and small components.
+Colour alone cannot distinguish same-colour object parts from holes. No blanket fill is
+applied; ambiguous material/background cases need additional evidence or user guidance.
 """
 
 from __future__ import annotations
@@ -37,7 +33,7 @@ def key_mask(work: Image.Image, bg: np.ndarray) -> np.ndarray:
     """Pixels that differ from the background colour, without specks."""
     a = np.asarray(work.convert("RGB"), np.int16)
     fg = np.abs(a - bg).max(axis=2) > KEY_TOL
-    keep = [c for c in largest_components(fg, min_ratio=0.0) if c.sum() >= MIN_AREA * fg.size]
+    keep = [c for c in largest_components(fg, min_ratio=0.0) if c.sum() >= 2]
     return np.logical_or.reduce(keep) if keep else np.zeros(fg.shape, bool)
 
 
@@ -50,7 +46,7 @@ def fill_holes(mask: np.ndarray) -> np.ndarray:
 
 
 def key_candidates(work: Image.Image, bg: np.ndarray) -> list[np.ndarray]:
-    """The colour key's connected pieces, holes filled, largest first."""
+    """The colour key's connected pieces, holes preserved, largest first."""
     fg = key_mask(work, bg)
     pieces = largest_components(fg, min_ratio=0.0)
-    return [fill_holes(p) for p in pieces if p.sum() >= MIN_AREA * fg.size]
+    return [p for p in pieces if p.sum() >= 2]

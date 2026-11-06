@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string>
 
 #include "pipeline_q.h"
@@ -90,6 +91,33 @@ int smq_matte(smq_context *ctx, const uint8_t *rgb, int width, int height, int s
     } catch (const sm::NothingSegmented &e) {
         set_error(err, err_len, e.what());
         return SMQ_NOTHING_SEGMENTED;
+    } catch (const std::exception &e) {
+        set_error(err, err_len, e.what());
+    } catch (...) {
+        set_error(err, err_len, "unknown error");
+    }
+    return SMQ_ERROR;
+}
+
+int smq_detail(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride,
+               uint8_t *out_direct_rgba, uint8_t *out_refined_rgba, smq_timings *timings,
+               char *err, size_t err_len) {
+    // Check before width*3 (signed overflow) or any pointer arithmetic/allocation.
+    const uint64_t limit = uint64_t(std::numeric_limits<ptrdiff_t>::max());
+    if (!ctx || !rgb || !out_direct_rgba || !out_refined_rgba || width <= 0 || height <= 0 ||
+        width > std::numeric_limits<int>::max() / 3 || stride < int64_t(width) * 3 ||
+        uint64_t(width) * uint64_t(height) > limit / 4 ||
+        uint64_t(height - 1) * uint64_t(stride) + uint64_t(width) * 3 > limit) {
+        set_error(err, err_len, "invalid arguments");
+        return SMQ_INVALID_ARGUMENTS;
+    }
+    try {
+        sm::TimingsQ t;
+        auto out = ctx->pipeline.detail(copy_rgb(rgb, width, height, stride), &t);
+        std::memcpy(out_direct_rgba, out[0].data.data(), out[0].data.size());
+        std::memcpy(out_refined_rgba, out[1].data.data(), out[1].data.size());
+        if (timings) *timings = {t.sam3, t.matting, t.total};
+        return SMQ_OK;
     } catch (const std::exception &e) {
         set_error(err, err_len, e.what());
     } catch (...) {

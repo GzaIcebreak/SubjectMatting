@@ -89,12 +89,14 @@ def test_complete_instance_fills_unsure_part_touching_the_core_and_drops_specks(
     assert m[50, 50]
 
 
-def test_drop_duplicates_keeps_disjoint_objects_and_drops_contained_ones():
+def test_drop_duplicates_preserves_complementary_and_disjoint_candidates():
     from matting.pipeline_vlm import drop_duplicates
 
     inst = instances((10, 10, 60, 90), (12, 12, 70, 88), (100, 10, 150, 90))
     inst.scores = np.array([0.9, 0.3, 0.8])
-    # #1 is mostly inside #0 (cat + a strip of blanket); #2 is a separate bag.
+    # A geometric overlap does not establish that the extra pixels are background.
+    assert drop_duplicates(inst, [0, 1, 2]) == [0, 1, 2]
+    inst.masks[1] = inst.masks[0].copy()
     assert drop_duplicates(inst, [0, 1, 2]) == [0, 2]
 
 
@@ -180,12 +182,12 @@ def test_fill_holes_fills_enclosed_but_not_open_notches():
     assert f[7, 7] and not f[11, 3]
 
 
-def test_key_candidates_keeps_white_teeth_in_a_face_on_white():
+def test_key_candidates_preserves_interior_background_without_semantic_guess():
     a = np.full((60, 60, 3), 255, np.uint8)
     a[10:50, 10:50] = (230, 170, 140)  # face
     a[30:35, 20:40] = 255  # white teeth
     (c,) = key_candidates(Image.fromarray(a), np.array([255, 255, 255]))
-    assert c[32, 30] and not c[2, 2]
+    assert not c[32, 30] and not c[2, 2]
 
 
 def test_grow_like_takes_connected_look_alikes_but_not_distant_ones():

@@ -35,6 +35,10 @@ public final class MattingEngineQ {
         OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeMutablePointer<UInt8>?, UnsafeMutableRawPointer?,
         UnsafeMutablePointer<CChar>?, Int
     ) -> Int32
+    private typealias Detail = @convention(c) (
+        OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeMutablePointer<UInt8>?, UnsafeMutablePointer<UInt8>?,
+        UnsafeMutableRawPointer?, UnsafeMutablePointer<CChar>?, Int
+    ) -> Int32
     private typealias Destroy = @convention(c) (OpaquePointer?) -> Void
     private typealias Prepare = @convention(c) (
         OpaquePointer?, UnsafePointer<UInt8>?, Int32, Int32, Int32, UnsafeMutablePointer<CChar>?, Int
@@ -79,6 +83,7 @@ public final class MattingEngineQ {
     private let masksFreeFn: MasksFree
     private let removeFn: Remove
     private let matteMaskFn: MatteMask
+    private let detailFn: Detail?
     private let ctx: OpaquePointer
 
     public init(library: URL, models: URL, precision: String = "fp16") throws {
@@ -100,6 +105,7 @@ public final class MattingEngineQ {
         masksFreeFn = try symbol("smq_masks_free", as: MasksFree.self)
         removeFn = try symbol("smq_remove", as: Remove.self)
         matteMaskFn = try symbol("smq_matte_mask", as: MatteMask.self)
+        detailFn = dlsym(h, "smq_detail").map { unsafeBitCast($0, to: Detail.self) }
         var err = [CChar](repeating: 0, count: 512)
         let errLen = err.count
         guard let c = create(models.path, precision, 0, &err, errLen) else {
@@ -223,4 +229,25 @@ public final class MattingEngineQ {
         default: throw Failure.other(String(cString: err))
         }
     }
+    static func validateDetailInput(count:Int,width:Int,height:Int) throws {
+        guard width>0,height>0,width<=Int(Int32.max)/3,height<=Int(Int32.max) else {throw Failure.other("无效图片尺寸")}
+        let (pixels,o1)=width.multipliedReportingOverflow(by:height)
+        let (_,o2)=pixels.multipliedReportingOverflow(by:4)
+        let (bytes,o3)=pixels.multipliedReportingOverflow(by:3)
+        guard !o1,!o2,!o3,count>=bytes else {throw Failure.other("RGB 数据不足或尺寸溢出")}
+    }
+
+    public func detail(rgb:[UInt8],width:Int,height:Int) throws -> (direct:[UInt8],refined:[UInt8],timings:Timings) {
+        try Self.validateDetailInput(count:rgb.count,width:width,height:height)
+        guard let fn=detailFn else {throw Failure.other("抠图库没有细节候选功能")}
+        var direct=[UInt8](repeating:0,count:width*height*4), refined=direct
+        var t=Timings(),err=[CChar](repeating:0,count:512)
+        let errLen=err.count
+        let rc=withUnsafeMutableBytes(of:&t) { ptr in
+            fn(ctx,rgb,Int32(width),Int32(height),Int32(width*3),&direct,&refined,ptr.baseAddress,&err,errLen)
+        }
+        guard rc==0 else {throw Failure.other(String(cString:err))}
+        return (direct,refined,t)
+    }
+
 }

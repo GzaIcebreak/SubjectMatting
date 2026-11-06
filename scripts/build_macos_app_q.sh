@@ -16,6 +16,8 @@ for f in sam3_image_encoder.fp16.onnx sam3_text_encoder.fp16.onnx sam3_decoder.f
 done
 [ -f "$CPP_BUILD/build.ninja" ] || [ -f "$CPP_BUILD/Makefile" ] || { echo "missing $CPP_BUILD: build cpp/ first" >&2; exit 1; }
 
+[ -f "$ROOT/onnx_models/birefnet_lite.fp16.onnx" ] || { echo "missing BiRefNet detail weights" >&2; exit 1; }
+
 STAGE="$(mktemp -d)"
 cmake --install "$CPP_BUILD" --prefix "$STAGE" >/dev/null
 
@@ -33,6 +35,7 @@ cp -L "$STAGE/lib/libonnxruntime.1.dylib" "$APP/Contents/Frameworks/"
 for f in sam3_image_encoder.fp16.onnx sam3_text_encoder.fp16.onnx sam3_decoder.fp16.onnx vitmatte.fp16.onnx clip_bpe_merges.txt; do
   cp "$MODELS/$f" "$APP/Contents/Resources/models/"
 done
+cp "$ROOT/onnx_models/birefnet_lite.fp16.onnx" "$APP/Contents/Resources/models/"
 rm -rf "$STAGE"
 
 codesign --force --sign - "$APP"/Contents/Frameworks/*.dylib "$APP/Contents/MacOS/matting-worker-q"

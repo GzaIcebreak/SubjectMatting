@@ -366,8 +366,8 @@ struct InfoBar: View {
     }
 
     private func stageText(_ stages: [String: Double]) -> String {
-        let names = ["qwen": "识别", "key": "纯色背景", "sam3": "分割", "judge": "判断", "matting": "边缘"]
-        return ["qwen", "key", "sam3", "judge", "matting"].compactMap { key in
+        let names = ["qwen": "识别", "key": "纯色背景", "sam3": "分割", "judge": "判断", "matting": "边缘", "detail": "细节", "review": "组合检查"]
+        return ["qwen", "key", "sam3", "judge", "matting", "detail", "review"].compactMap { key in
             stages[key].map { "\(names[key]!) \(String(format: "%.1f", $0))s" }
         }.joined(separator: " · ")
     }

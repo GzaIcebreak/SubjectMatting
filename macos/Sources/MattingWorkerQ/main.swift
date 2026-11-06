@@ -8,6 +8,7 @@
 // Environment: DASHSCOPE_API_KEY (required; the app passes it from the Keychain), SUBJECTMATTING_QWEN_MODEL,
 // SUBJECTMATTING_QWEN_JUDGE_MODEL, DASHSCOPE_BASE_URL, SUBJECTMATTING_LOG (default ~/Library/Logs/SubjectMattingQ.log).
 import Foundation
+import CryptoKit
 import MattingCore
 import MattingQ
 
@@ -86,7 +87,7 @@ let runs = RunQueue()
 
 /// One line per image in the log: what was done and how long each step took.
 func log(_ name: String, _ img: ImageFiles.RGB, _ what: String, _ stages: [String: Double]) {
-    let order = ["load", "prepare", "qwen", "key", "sam3", "judge", "remove", "matting", "write"]
+    let order = ["load", "prepare", "qwen", "key", "sam3", "judge", "remove", "matting", "detail", "review", "write"]
     let parts = order.compactMap { k in stages[k].map { "\(k) \(String(format: "%.2f", $0))" } }
     let total = stages.values.reduce(0, +)
     let line = "\(name) \(img.width)x\(img.height): \(what) | \(parts.joined(separator: " ")) | total \(String(format: "%.2f", total))s\n"
@@ -263,7 +264,7 @@ while let msg = runs.take() {
         var keep = Array(cands.masks.indices)
         var judgeSeconds: Double?
         var judgeNote = ""
-        if needsJudge(cands.owners) {
+        if !cands.usedKey && needsJudge(cands.owners) {
             let tJudge = Date()
             do {
                 let sheet = try ImageFiles.candidateSheet(img, masks: cands.masks, maskWidth: cands.width, maskHeight: cands.height)
@@ -284,27 +285,95 @@ while let msg = runs.take() {
 
         // See-through regions inside the subjects.
         let tRemove = Date()
-        try engine.remove(rgb: img.pixels, width: img.width, height: img.height, mask: &mask, regions: detection.remove)
+        // Semantic boxes and colour similarity cannot prove background membership.
+        // Preserve the mask until a pixel-evidence-based interior matte is available.
         let removeSeconds = Date().timeIntervalSince(tRemove)
 
         var (rgba, t) = try engine.matteMask(rgb: img.pixels, width: img.width, height: img.height, mask: mask)
         if let alpha = img.alpha {  // transparent in the file stays transparent
             for i in 0..<(img.width * img.height) { rgba[i * 4 + 3] = min(rgba[i * 4 + 3], alpha[i]) }
         }
+        let originalRGBA = rgba
+        var hybridDecision = HybridSelection.Decision(useDetail: false, reason: "组合流程关闭")
+        var hybridReview: HybridReview?
+        var hybridMetrics: HybridSelection.Metrics?
+        var detailRGBA: [UInt8]?
+        var directRGBA: [UInt8]?
+        var rawDetailRGBA: [UInt8]?
+        var detailSeconds = 0.0, reviewSeconds = 0.0
+        var hybridError: String?
+        if env["SUBJECTMATTING_HYBRID"] != "0" {
+            let started = Date()
+            do {
+                let d = try engine.detail(rgb: img.pixels, width: img.width, height: img.height)
+                if msg["audit_dir"] is String {directRGBA = d.direct; rawDetailRGBA = d.refined}
+                var detail = HybridSelection.protectThinLines(direct: d.direct, refined: d.refined, width: img.width, height: img.height)
+                if let alpha = img.alpha { for i in alpha.indices { detail[i*4+3] = min(detail[i*4+3], alpha[i]) } }
+                detailRGBA = detail
+                detailSeconds = Date().timeIntervalSince(started)
+                let metrics = HybridSelection.metrics(original: originalRGBA, detail: detail, width: img.width, height: img.height, subjects: detection.subjects)
+                hybridMetrics = metrics
+                if metrics.severeLoss || metrics.targetExpansion {
+                    hybridDecision = HybridSelection.choose(review: nil, severeLoss: metrics.severeLoss, targetExpansion: metrics.targetExpansion)
+                } else if metrics.disagreement < 0.005 {
+                    hybridDecision = HybridSelection.Decision(useDetail: false, reason: "候选几乎一致，保留原流程")
+                } else {
+                    let reviewStart = Date()
+                    do {
+                        hybridReview = try qwen.reviewHybrid(jpeg: item.jpeg, img: img, original: originalRGBA, detail: detail,
+                                                            subjects: detection.subjects, instruction: instruction)
+                    } catch { hybridError = "组合判断失败：\(error)" }
+                    reviewSeconds = Date().timeIntervalSince(reviewStart)
+                    hybridDecision = HybridSelection.choose(review: hybridReview, severeLoss: false)
+                }
+                if hybridDecision.useDetail { rgba = detail }
+            } catch {
+                detailSeconds = Date().timeIntervalSince(started)
+                hybridError = "细节候选失败：\(error)"
+                hybridDecision = HybridSelection.choose(review: nil, severeLoss: false)
+            }
+        }
         let tWrite = Date()
         try ImageFiles.writePNG(rgba: rgba, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dstURL)
+        // Opt-in audit for reproducible tests; ordinary app jobs create only the requested output PNG.
+        if let auditPath = msg["audit_dir"] as? String {
+            do {
+                let runID = UUID().uuidString
+                var dir = URL(fileURLWithPath: auditPath)
+                if let files=try? FileManager.default.contentsOfDirectory(atPath:dir.path), files.contains("decision.json") || files.contains("original.png") {dir=dir.appendingPathComponent(runID)}
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for (file, pixels) in [("original.png", Optional(originalRGBA)), ("detail.png", detailRGBA),
+                                       ("direct.png", directRGBA), ("detail_raw.png", rawDetailRGBA), ("final.png", Optional(rgba))] {
+                    if let pixels { try ImageFiles.writePNG(rgba: pixels, width: img.width, height: img.height, colorSpace: img.colorSpace, to: dir.appendingPathComponent(file)) }
+                }
+                if let detailRGBA {
+                    try ImageFiles.jpegForUpload(ImageFiles.compositeForReview(img,rgba:originalRGBA)).write(to:dir.appendingPathComponent("review_original.jpg"))
+                    try ImageFiles.jpegForUpload(ImageFiles.compositeForReview(img,rgba:detailRGBA)).write(to:dir.appendingPathComponent("review_detail.jpg"))
+                    for (index,jpeg) in try ImageFiles.hybridEvidence(img,original:originalRGBA,detail:detailRGBA).enumerated() {try jpeg.write(to:dir.appendingPathComponent("review_crop_\(index).jpg"))}
+                }
+                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) }
+                var record: [String: Any] = ["run_id":runID, "delivered":true, "dst":dst, "sha256":SHA256.hash(data:try Data(contentsOf:dstURL)).map{String(format:"%02x",$0)}.joined(), "decision": try object(hybridDecision), "subjects": detection.subjects.map { ["label": $0.label, "box": $0.box] as [String: Any] },
+                                            "used_key": cands.usedKey, "kept_candidates": keep, "detail_seconds": detailSeconds, "review_seconds": reviewSeconds]
+                if let hybridMetrics { record["metrics"] = try object(hybridMetrics) }
+                if let hybridReview { record["review"] = try object(hybridReview) }
+                if let hybridError { record["error"] = hybridError }
+                try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys, .prettyPrinted]).write(to: dir.appendingPathComponent("decision.json"))
+            } catch { FileHandle.standardError.write("audit failed: \(error)\n".data(using: .utf8)!) }
+        }
         let segmentKey = cands.usedKey ? "key" : "sam3"
         var stages: [String: Double] = ["load": item.loadSeconds, "prepare": prepareSeconds, "qwen": qwenWaitSeconds, segmentKey: segmentSeconds,
-                                        "remove": removeSeconds, "matting": t.matting, "write": Date().timeIntervalSince(tWrite)]
+                                        "remove": removeSeconds, "matting": t.matting, "detail": detailSeconds, "review": reviewSeconds, "write": Date().timeIntervalSince(tWrite)]
         if let judgeSeconds { stages["judge"] = judgeSeconds }
-        let what = "\(instruction.map { "「\($0)」" } ?? "auto") \(detection.subjects.map(\.label)) \(segmentKey) \(cands.masks.count) cand keep \(keep.map { $0 + 1 })"
-            + (detection.remove.isEmpty ? "" : " remove \(detection.remove.map(\.label))")
-            + " (Qwen \(String(format: "%.2f", item.qwenSeconds))s, waited \(String(format: "%.2f", qwenWaitSeconds))s)" + judgeNote
+        var what = "\(instruction ?? "auto") \(detection.subjects.map(\.label)) \(segmentKey) \(cands.masks.count) cand"
+        what += " keep \(keep.map { $0 + 1 })"
+        what += " hybrid=\(hybridDecision.useDetail ? "detail" : "original") \(hybridDecision.reason)"
+        what += " \(hybridError ?? "") \(judgeNote)"
+        what += " (Qwen \(String(format: "%.2f", item.qwenSeconds))s)"
         log(name, img, what, stages)
         // The app shows: 识别 (Qwen), 纯色背景 or 分割 (incl. SAM3's image encoding and the cut-outs), 判断, 边缘.
-        var shown: [String: Double] = ["qwen": qwenWaitSeconds, segmentKey: prepareSeconds + segmentSeconds + removeSeconds, "matting": t.matting]
+        var shown: [String: Double] = ["qwen": qwenWaitSeconds, segmentKey: prepareSeconds + segmentSeconds + removeSeconds, "matting": t.matting, "detail": detailSeconds, "review": reviewSeconds]
         if let judgeSeconds { shown["judge"] = judgeSeconds }
-        send(["type": "result", "id": id, "dst": dst, "total": shown.values.reduce(0, +), "stages": shown])
+        send(["type": "result", "id": id, "dst": dst, "total": shown.values.reduce(0, +), "stages": shown, "hybrid": hybridDecision.useDetail ? "detail" : "original", "hybrid_reason": hybridDecision.reason])
     } catch let MattingEngineQ.Failure.nothingSegmented(message) {
         send(["type": "error", "id": id, "message": "没有在 Qwen 给出的位置分割出对象（\(message)）"])
     } catch {

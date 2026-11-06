@@ -61,6 +61,19 @@ SMQ_API int smq_matte(smq_context *ctx, const uint8_t *rgb, int width, int heigh
                       int num_subjects, uint8_t *out_rgba, smq_timings *timings, char *err, size_t err_len);
 
 /*
+ * Independent detail sidecar: BiRefNet_lite at 1024, then its >0.5 mask through the traditional shared trimap
+ * and full-frame ViTMatte. Work long side <=1024; both straight-alpha RGBA outputs retain source RGB/size.
+ * Lazily loads <models_dir>/birefnet_lite.fp16.onnx (default 4 intra-op threads when num_threads <=0).
+ * Does not run SAM3 or change prepared features. Missing-model errors are recoverable on the same context.
+ * rgb/stride follow smq_matte; both output buffers are required, distinct, and width*height*4 bytes each.
+ * timings is optional: sam3 = BiRefNet/preprocessing, matting = trimap/ViTMatte/composition, total = both.
+ * Returns SMQ_OK, SMQ_INVALID_ARGUMENTS or SMQ_ERROR. Outputs/timings are unchanged on failure.
+ */
+SMQ_API int smq_detail(smq_context *ctx, const uint8_t *rgb, int width, int height, int stride,
+                       uint8_t *out_direct_rgba, uint8_t *out_refined_rgba, smq_timings *timings,
+                       char *err, size_t err_len);
+
+/*
  * Auto mode for solid backgrounds (product shots, renders): if the image border is one uniform colour, the subject is
  * everything that differs from it - no subjects needed, no SAM3 run. Returns SMQ_NOT_PLAIN otherwise; then ask the
  * vision-language model and call smq_matte. timings->sam3 holds the keying time.

@@ -32,7 +32,8 @@ struct Instances {
 double inside_fraction(const std::vector<float> &prob, int w, int h, const std::array<double, 4> &box, double margin = 0.05);
 std::vector<int> select_instances(const Instances &inst, const std::array<double, 4> &box, double min_inside = 0.5,
                                   double fallback_iou = 0.3);
-std::vector<int> drop_duplicates(const Instances &inst, const std::vector<int> &idx, double share = 0.5);
+std::vector<int> drop_duplicates(const Instances &inst, const std::vector<int> &idx, double share = 0.98);
+std::vector<uint8_t> make_trimap_q(const Mask &mask);
 Mask complete_instance(const std::vector<float> &prob, int w, int h, const std::array<double, 4> &box);
 
 // Plain-background fast path (matting/plain_background.py): the background colour if the border ring is uniform.
@@ -43,7 +44,7 @@ Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg);
 bool is_plain(const ImageU8 &rgb);
 // mask plus every region of ~mask not connected to the border (4-connectivity).
 Mask fill_holes(const Mask &mask);
-// The colour key's connected pieces with their holes filled, largest first.
+// The colour key's connected pieces, preserving holes, largest first.
 std::vector<Mask> key_candidates(const ImageU8 &work, const std::array<double, 3> &bg);
 // seed plus the pixels of `within` connected to it whose colour (quantized) also occurs in it, near the box.
 Mask grow_like(const Mask &seed, const Mask &within, const ImageU8 &work, const std::array<double, 4> &box);
@@ -82,6 +83,11 @@ public:
 
     // rgb: 3-channel image; subjects in its pixel coordinates -> RGBA. Throws NothingSegmented or runtime_error.
     ImageU8 run(const ImageU8 &rgb, const std::vector<Subject> &subjects, TimingsQ *timings = nullptr);
+
+    // Independent, bounded detail sidecar: [direct BiRefNet RGBA, binary-trimap + full-frame ViTMatte RGBA].
+    // Lazily loads <models_dir>/birefnet_lite.fp16.onnx; never reads or changes cached SAM3 features.
+    // timings->sam3 holds BiRefNet/preprocessing time. Both outputs are at rgb's original size.
+    std::array<ImageU8, 2> detail(const ImageU8 &rgb, TimingsQ *timings = nullptr);
 
     // Encodes the image with SAM3's image encoder ahead of run() (e.g. while the caller waits for Qwen); run() on the
     // same pixels then skips that step. Throws runtime_error.

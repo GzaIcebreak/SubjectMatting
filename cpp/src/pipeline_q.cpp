@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <numeric>
 
 #include "clip_tokenizer.h"
@@ -179,7 +180,7 @@ Mask key_mask(const ImageU8 &work, const std::array<double, 3> &bg) {
     std::vector<int64_t> areas;
     int n = connected_components(fg, labels, &areas);
     std::vector<uint8_t> keep(n, 0);
-    for (int l = 1; l < n; l++) keep[l] = double(areas[l]) >= kMinArea * double(fg.data.size());
+    for (int l = 1; l < n; l++) keep[l] = areas[l] >= 2;
     for (size_t i = 0; i < fg.data.size(); i++) fg.data[i] = keep[labels[i]];
     return fg;
 }
@@ -218,7 +219,7 @@ std::vector<Mask> key_candidates(const ImageU8 &work, const std::array<double, 3
     Mask fg = key_mask(work, bg);
     std::vector<Mask> out;
     for (Mask &piece : largest_components(fg, 0.0))
-        if (double(piece.count()) >= kMinArea * double(fg.data.size())) out.push_back(fill_holes(piece));
+        if (piece.count() >= 2) out.push_back(std::move(piece));
     return out;
 }
 
@@ -298,6 +299,9 @@ struct PipelineQ::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "subject_matting_q"};
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::unique_ptr<Ort::Session> image_encoder, text_encoder, decoder, vitmatte;
+    std::unique_ptr<Ort::Session> detail_birefnet;
+    std::string detail_model_path;
+    int detail_threads = 4;
     std::vector<std::string> decoder_inputs;
     std::unique_ptr<ClipTokenizer> tokenizer;
     std::map<std::string, std::pair<std::vector<float>, std::vector<int64_t>>> text_cache;  // label -> text, tokens
@@ -309,6 +313,48 @@ struct PipelineQ::Impl {
     static std::vector<float> copy(Ort::Value &v) {
         const float *p = v.GetTensorData<float>();
         return std::vector<float>(p, p + v.GetTensorTypeAndShapeInfo().GetElementCount());
+    }
+
+    std::vector<float> detail_probability(const ImageU8 &work) {
+        if (!detail_birefnet) {
+            Ort::SessionOptions opts;
+            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            opts.SetIntraOpNumThreads(detail_threads);
+            opts.SetInterOpNumThreads(1);
+            opts.DisableCpuMemArena();
+            opts.DisableMemPattern();
+            try {
+                // Assign only on success: a missing model can be installed and retried on this context.
+                detail_birefnet = std::make_unique<Ort::Session>(env, to_ort_path(detail_model_path).c_str(), opts);
+            } catch (const Ort::Exception &e) {
+                throw std::runtime_error("cannot load " + detail_model_path + ": " + e.what());
+            }
+        }
+        constexpr int size = 1024;
+        constexpr size_t plane = size_t(size) * size;
+        constexpr float mean[] = {0.485f, 0.456f, 0.406f}, stddev[] = {0.229f, 0.224f, 0.225f};
+        ImageU8 resized = pil_resize(work, size, size, Filter::Bilinear);
+        std::vector<float> x(3 * plane);
+        for (size_t i = 0; i < plane; i++)
+            for (int c = 0; c < 3; c++)
+                x[c * plane + i] = (float(resized.data[i * 3 + c]) / 255.f - mean[c]) / stddev[c];
+        std::vector<Ort::Value> in;
+        in.push_back(tensor(x, {1, 3, size, size}));
+        Ort::AllocatorWithDefaultOptions alloc;
+        auto output_name = detail_birefnet->GetOutputNameAllocated(0, alloc);
+        const char *in_names[] = {"pixel_values"}, *out_names[] = {output_name.get()};
+        auto out = detail_birefnet->Run(Ort::RunOptions{nullptr}, in_names, in.data(), 1, out_names, 1);
+        auto info = out[0].GetTensorTypeAndShapeInfo();
+        if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+            info.GetShape() != std::vector<int64_t>{1, 1, size, size})
+            throw std::runtime_error("unexpected BiRefNet probability output (expected float32 1x1x1024x1024)");
+        const float *prob = out[0].GetTensorData<float>();
+        for (size_t i = 0; i < plane; i++)
+            if (!std::isfinite(prob[i])) throw std::runtime_error("non-finite BiRefNet probability");
+        // The exported graph already returns probabilities. Keep float precision through both resizes.
+        std::vector<float> alpha(size_t(work.w) * work.h);
+        resize_linear(prob, size, size, alpha.data(), work.w, work.h);
+        return alpha;
     }
 
     using Feats = PipelineQ::Feats;
@@ -433,6 +479,8 @@ struct PipelineQ::Impl {
 PipelineQ::PipelineQ(const std::string &models_dir, const std::string &precision, int num_threads)
     : impl_(std::make_unique<Impl>()) {
     impl_->env.DisableTelemetryEvents();
+    impl_->detail_model_path = models_dir + "/birefnet_lite.fp16.onnx";
+    impl_->detail_threads = num_threads > 0 ? num_threads : 4;
     Ort::SessionOptions opts;
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     if (num_threads > 0) opts.SetIntraOpNumThreads(num_threads);
@@ -455,6 +503,44 @@ PipelineQ::PipelineQ(const std::string &models_dir, const std::string &precision
 }
 
 PipelineQ::~PipelineQ() = default;
+
+std::array<ImageU8, 2> PipelineQ::detail(const ImageU8 &rgb, TimingsQ *timings) {
+    if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0 ||
+        uint64_t(rgb.w) * uint64_t(rgb.h) > uint64_t(std::numeric_limits<ptrdiff_t>::max()) / 4 ||
+        rgb.data.size() < size_t(rgb.w) * rgb.h * 3)
+        throw std::runtime_error("expected a non-empty RGB image");
+    try {
+        const double t0 = now();
+        const double scale = 1024.0 / std::max(rgb.w, rgb.h);
+        ImageU8 work = scale < 1.0
+            ? pil_resize(rgb, int(std::max(1L, round_half_even(rgb.w * scale))),
+                         int(std::max(1L, round_half_even(rgb.h * scale))), Filter::Bicubic)
+            : rgb;
+        std::vector<float> direct = impl_->detail_probability(work);
+        const double t1 = now();
+        Mask mask(work.w, work.h);
+        for (size_t i = 0; i < direct.size(); i++) mask.data[i] = direct[i] > 0.5f;
+        // Deliberately use the traditional shared trimap and the entire work image, matching binary.png.
+        std::vector<float> refined = impl_->matte(work, make_trimap(mask));
+        auto compose = [&](const std::vector<float> &alpha) {
+            std::vector<float> full(size_t(rgb.w) * rgb.h);
+            resize_linear(alpha.data(), work.w, work.h, full.data(), rgb.w, rgb.h);
+            ImageU8 out(rgb.w, rgb.h, 4);
+            for (size_t i = 0; i < full.size(); i++) {
+                if (!std::isfinite(full[i])) throw std::runtime_error("non-finite detail alpha");
+                for (int c = 0; c < 3; c++) out.data[i * 4 + c] = rgb.data[i * 3 + c];
+                out.data[i * 4 + 3] = uint8_t(std::clamp(full[i], 0.f, 1.f) * 255.f);
+            }
+            return out;
+        };
+        std::array<ImageU8, 2> out{compose(direct), compose(refined)};
+        const double t2 = now();
+        if (timings) *timings = {t1 - t0, t2 - t1, t2 - t0};
+        return out;
+    } catch (const Ort::Exception &e) {
+        throw std::runtime_error(std::string("onnxruntime: ") + e.what());
+    }
+}
 
 ImageU8 PipelineQ::run(const ImageU8 &rgb, const std::vector<Subject> &subjects, TimingsQ *timings) {
     if (rgb.channels != 3 || rgb.w <= 0 || rgb.h <= 0) throw std::runtime_error("expected a non-empty RGB image");
@@ -562,10 +648,20 @@ std::vector<Candidate> PipelineQ::candidates(const ImageU8 &rgb, const std::vect
             const Subject &s = subjects[k];
             std::array<double, 4> box{s.box[0] * sx, s.box[1] * sy, s.box[2] * sx, s.box[3] * sy};
             Instances inst = impl_->find(feats, s.label, box, w, h);
+            std::vector<Mask> groups;
             for (int i : drop_duplicates(inst, select_instances(inst, box))) {
                 Mask m = complete_instance(inst.probs[i], w, h, box);
-                if (m.any()) out.push_back({std::move(m), k});
+                if (!m.any()) continue;
+                for (size_t g=0; g<groups.size();) {
+                    bool overlaps=false;
+                    for(size_t j=0;j<m.data.size();++j) if(m.data[j] && groups[g].data[j]) { overlaps=true; break; }
+                    if (!overlaps) { ++g; continue; }
+                    for(size_t j=0;j<m.data.size();++j) m.data[j] |= groups[g].data[j];
+                    groups.erase(groups.begin()+g); g=0;
+                }
+                groups.push_back(std::move(m));
             }
+            for (auto &m:groups) out.push_back({std::move(m),k});
         }
         return out;
     } catch (const Ort::Exception &e) {
@@ -615,8 +711,24 @@ ImageU8 PipelineQ::matte_mask(const ImageU8 &rgb, const Mask &mask) {
     }
 }
 
+std::vector<uint8_t> make_trimap_q(const Mask &mask) {
+    auto trimap = make_trimap(mask);
+    auto dist = distance_transform(mask, 3);
+    Mask filled = fill_holes(mask);
+    for (int y=0; y<mask.h; ++y) for (int x=0; x<mask.w; ++x) {
+        size_t i=size_t(y)*mask.w+x;
+        if (!mask.data[i] && filled.data[i]) { trimap[i]=0; continue; }
+        if (!mask.data[i] || trimap[i]==255) continue;
+        // A local ridge keeps narrow branches attached to a thick component alive.
+        float l=x>0?dist[i-1]:0, r=x+1<mask.w?dist[i+1]:0;
+        float u=y>0?dist[i-mask.w]:0, d=y+1<mask.h?dist[i+mask.w]:0;
+        if ((dist[i]>l && dist[i]>=r) || (dist[i]>u && dist[i]>=d)) trimap[i]=255;
+    }
+    return trimap;
+}
+
 ImageU8 PipelineQ::matte_and_compose(const ImageU8 &rgb, const ImageU8 &work, const Mask &mask) {
-    std::vector<uint8_t> trimap = make_trimap(mask);
+    std::vector<uint8_t> trimap = make_trimap_q(mask);
     // ViTMatte only on the trimap's non-background box plus a margin (matte_cropped in pipeline_vlm.py).
     int x0 = work.w, y0 = work.h, x1 = -1, y1 = -1;
     for (int y = 0; y < work.h; y++)
